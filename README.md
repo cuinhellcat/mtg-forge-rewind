@@ -24,30 +24,33 @@ Built and tested against tag `forge-2.0.13`.
   clients stay compatible. They will see a version-mismatch warning in the lobby chat,
   which is harmless.
 
-## Included bug fix
+## Included snapshot fixes
 
-`GameSnapshot` did not remove cards that exist in the running game but not in the snapshot
-— tokens, copies and effect cards created after it was taken. Restoring then walked the
-battlefield, looked those cards up in the snapshot, and hit a `NullPointerException`. This
-never showed up in Forge's own use of snapshots, because cancelling a cast creates no new
-objects, but it makes any real rewind crash. The fix removes such cards from the game
-during the restore, which is what rewinding past their creation means anyway.
+Rewinding leans on Forge's snapshots far harder than cancelling a cast does, which brings
+four separate defects in them to the surface. All four are in the patch, and each is
+offered to Forge on its own, since they matter to anyone using undo restore:
 
-This fix is useful on its own and would be worth upstreaming.
+| What was wrong | Upstream |
+|---|---|
+| Cards that exist in the running game but not in the snapshot — tokens, copies, effect cards — were never removed on restore, so the attachment loop looked them up and dereferenced null. Harmless while snapshots only unwound a cancelled cast, fatal for any real rewind. | [PR #11416](https://github.com/Card-Forge/forge/pull/11416) |
+| A foretold card lost its foretold state on restore and could no longer be cast with Foretell — the two setters for it had sat commented out since the method was written. | [#7844](https://github.com/Card-Forge/forge/issues/7844) |
+| Cards were filed under their controller rather than the player whose zone they are in, so a stolen card ended up in the wrong graveyard. | [#9297](https://github.com/Card-Forge/forge/issues/9297) |
+| Rolling back through a snapshot skipped the ability cleanup entirely: announced values, targets and the frozen stack survived the cancelled cast. | [#10049](https://github.com/Card-Forge/forge/issues/10049), [#8762](https://github.com/Card-Forge/forge/issues/8762) |
 
 ## Files touched
 
 | File | Change |
 |---|---|
 | `forge-game/…/Game.java` | rewind point history, `rewindToActionOf`, `getAvailableRewindSteps` |
-| `forge-game/…/GameSnapshot.java` | remove cards the snapshot does not know (the fix above) |
+| `forge-game/…/GameSnapshot.java` | the first three snapshot fixes above |
+| `forge-game/…/GameActionUtil.java` | the fourth: ability cleanup on a snapshot rollback |
 | `forge-game/…/phase/PhaseHandler.java` | `PriorityState` for the bookkeeping snapshots miss; rewind check in `mainLoopStep` |
 | `forge-game/…/player/PlayerController.java` | hooks for requesting a rewind |
 | `forge-gui/…/player/PlayerControllerHuman.java` | request handling, full resync of clients afterwards |
 | `forge-gui/…/net/server/FServerManager.java` | `resyncAllClients()` |
 | `forge-gui-desktop/…/menus/GameMenu.java` | the menu entry |
 | `forge-gui/res/languages/en-US.properties` | three new strings |
-| `forge-gui-desktop/src/test/java/forge/ai/RewindTest.java` | new tests |
+| `forge-gui-desktop/src/test/java/forge/ai/*Test.java` | tests for the rewind and for each snapshot fix |
 
 ## Build
 
@@ -80,12 +83,14 @@ Forge launcher is tight with several of them.
 ## Tests
 
 ```sh
-mvn -B -pl forge-gui-desktop test -Dtest=RewindTest
+mvn -B -pl forge-gui-desktop -am test -Dtest='RewindTest,ForetellSnapshotTest,SnapshotStolenCardTest,RollbackCleanupTest'
 ```
 
-Five tests cover taking back one and several own actions, undoing an opponent's move along
-with your own, restoring turn/phase/priority, and the step limit. Forge's own desktop suite
-(276 tests) and its TCP network integration test pass with the patch applied.
+`RewindTest` covers taking back one and several own actions, undoing an opponent's move
+along with your own, restoring turn/phase/priority, and the step limit. The other three
+reproduce the snapshot defects listed above: each fails without its fix and passes with it.
+Forge's own desktop suite and its TCP network integration test pass with the patch applied
+(279 tests in total, all green).
 
 Not covered by automated tests: clicking the menu entry in a live match. The engine side is
 tested, the GUI wiring is not.
@@ -105,5 +110,6 @@ GPL v3, same as Forge — this is derived work and cannot be anything else. See 
 **Kurz auf Deutsch:** Dieser Patch gibt Forge im Mehrspieler-Modus einen echten
 Rückgängig-Knopf: Der Gastgeber kann bis zu drei eigene Aktionen zurücknehmen, samt allem,
 was seitdem passiert ist. Mitspieler brauchen keine geänderte Version. Enthält nebenbei
-einen Fehler-Fix in Forges Schnappschuss-Code (Spielsteine und Kopien wurden beim
-Zurückholen nicht entfernt, was zum Absturz führte).
+vier Fehlerkorrekturen an Forges Schnappschuss-Code, die beim Bauen aufgefallen sind — vom
+Absturz durch nicht entfernte Spielsteine bis zum eingefrorenen Stapel nach einem
+abgebrochenen Zauberspruch. Jede davon ist Forge auch einzeln angeboten.

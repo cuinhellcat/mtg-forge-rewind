@@ -140,7 +140,7 @@ index 3456a071..3bad73ba 100644
          lastStateBattlefield.clear();
          lastStateGraveyard.clear();
 diff --git a/forge-game/src/main/java/forge/game/GameSnapshot.java b/forge-game/src/main/java/forge/game/GameSnapshot.java
-index d74b5ca1..36554c11 100644
+index d74b5ca1..56863418 100644
 --- a/forge-game/src/main/java/forge/game/GameSnapshot.java
 +++ b/forge-game/src/main/java/forge/game/GameSnapshot.java
 @@ -14,6 +14,7 @@ import forge.game.spellability.SpellAbility;
@@ -151,7 +151,33 @@ index d74b5ca1..36554c11 100644
  import forge.game.zone.ZoneType;
  
  import java.util.Collections;
-@@ -334,6 +335,19 @@ public class GameSnapshot {
+@@ -298,7 +299,12 @@ public class GameSnapshot {
+ 
+         for(Card fromCard : fromGame.getCardsInGame()) {
+             Card newCard = toGame.findById(fromCard.getId());
+-            Player toPlayer = findBy(toGame, fromCard.getController());
++            // Zones belong to a player: the controller's battlefield, but the owner's
++            // graveyard, hand and library. Going by the controller alone files a card whose
++            // control has changed under the wrong player, so a stolen creature that died
++            // reappears in the thief's graveyard when the snapshot is used.
++            Player fromZonePlayer = fromCard.getZone().getPlayer();
++            Player toPlayer = findBy(toGame, fromZonePlayer != null ? fromZonePlayer : fromCard.getController());
+             ZoneType fromType = fromCard.getZone().getZoneType();
+             int zonePosition = 0;
+             if (ZoneType.ORDERED_ZONES.contains(fromType)) {
+@@ -308,8 +314,9 @@ public class GameSnapshot {
+             }
+ 
+             if (newCard == null) {
+-                // Storing a game uses this path...
+-                newCard = createCardCopy(toGame, toPlayer, fromCard);
++                // Storing a game uses this path... the copy keeps the original owner, which
++                // is not the same player as the one whose zone it currently sits in.
++                newCard = createCardCopy(toGame, findBy(toGame, fromCard.getOwner()), fromCard);
+             } else {
+                 ZoneType type = newCard.getZone().getZoneType();
+                 if (type != fromType) {
+@@ -334,6 +341,19 @@ public class GameSnapshot {
              setCardInCopiedGame(toGame, ue.toPlayer, ue.fromCard, ue.newCard, ue.fromType, ue.zonePosition);
          }
  
@@ -171,6 +197,17 @@ index d74b5ca1..36554c11 100644
          // This loop happens later to make sure all cards are in the correct zone first
          for (Card newCard : toGame.getCardsIn(ZoneType.Battlefield)) {
              Card fromCard = fromGame.findById(newCard.getId());
+@@ -389,8 +409,8 @@ public class GameSnapshot {
+         newCard.setFaceDown(fromCard.isFaceDown());
+         newCard.setManifested(fromCard.getManifestedSA());
+         newCard.setSickness(fromCard.hasSickness());
+-        //newCard.setForetold(fromCard.isForetold());
+-        //newCard.setForetoldCostByEffect(fromCard.isForetoldCostByEffect());
++        newCard.setForetold(fromCard.isForetold());
++        newCard.setForetoldCostByEffect(fromCard.isForetoldCostByEffect());
+         newCard.setState(fromCard.getCurrentStateName(), false);
+     }
+ 
 diff --git a/forge-game/src/main/java/forge/game/phase/PhaseHandler.java b/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
 index c95b9061..606a041a 100644
 --- a/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
@@ -346,6 +383,60 @@ index 4281a454..3c3a76d7 100644
      private SkinnedMenuItem getMenuItem_Undo() {
          final Localizer localizer = Localizer.getInstance();
          final SkinnedMenuItem menuItem = new SkinnedMenuItem(localizer.getMessage("lblUndo"));
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/ForetellSnapshotTest.java b/forge-gui-desktop/src/test/java/forge/ai/ForetellSnapshotTest.java
+new file mode 100644
+index 00000000..bfdfbcc2
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/ForetellSnapshotTest.java
+@@ -0,0 +1,48 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.card.Card;
++import forge.game.player.Player;
++import forge.game.zone.ZoneType;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++/**
++ * Reproduces #7844: a foretold card that is cast from exile and then cancelled comes back
++ * face up and can no longer be cast with Foretell.
++ *
++ * The steps below are what the cancel does internally: a snapshot is taken while the card
++ * sits face down in exile, casting turns it face up and moves it to the stack, and the
++ * rollback restores the snapshot.
++ */
++public class ForetellSnapshotTest extends AITest {
++
++    @Test
++    public void foretoldCardIsStillForetoldAfterRollback() {
++        Game game = initAndCreateGame();
++        game.EXPERIMENTAL_RESTORE_SNAPSHOT = true;
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().setPriority(p);
++
++        Card card = addCardToZone("Doomskar Oracle", p, ZoneType.Exile);
++        card.setForetold(true);
++        card.turnFaceDown(true);
++        AssertJUnit.assertTrue(card.isForetold());
++        AssertJUnit.assertTrue(card.isFaceDown());
++
++        game.stashGameState();
++
++        // Cast it: face up, onto the stack.
++        card.turnFaceUp(false, null);
++        game.getAction().moveTo(ZoneType.Stack, card, null, null);
++
++        // Cancel: roll back to the snapshot.
++        AssertJUnit.assertTrue(game.restoreGameState());
++
++        Card after = game.findById(card.getId());
++        AssertJUnit.assertNotNull("card should still be in the game", after);
++        AssertJUnit.assertEquals("card should be back in exile", ZoneType.Exile, after.getZone().getZoneType());
++        AssertJUnit.assertTrue("card should be face down again", after.isFaceDown());
++        AssertJUnit.assertTrue("card should still be foretold", after.isForetold());
++    }
++}
 diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java
 new file mode 100644
 index 00000000..e03c3f22
@@ -490,6 +581,122 @@ index 00000000..e03c3f22
 +        plain.stashGameState();
 +        AssertJUnit.assertEquals(0, plain.getAvailableRewindSteps(q));
 +        AssertJUnit.assertFalse(plain.rewindToActionOf(q, 1));
++    }
++}
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/RollbackCleanupTest.java b/forge-gui-desktop/src/test/java/forge/ai/RollbackCleanupTest.java
+new file mode 100644
+index 00000000..c8552b97
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/RollbackCleanupTest.java
+@@ -0,0 +1,51 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.GameActionUtil;
++import forge.game.card.Card;
++import forge.game.cost.CostPayment;
++import forge.game.player.Player;
++import forge.game.spellability.SpellAbility;
++import forge.game.zone.ZoneType;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++/**
++ * Rolling back a cast via the snapshot has to clean up the ability as well: the snapshot
++ * holds cards, zones and mana, but not what the player announced, targeted, or the frozen
++ * stack. Leaving those behind is what #10049 (spell can no longer be cast after a cancel)
++ * and #8762 (cancelling freezes the game) look like.
++ */
++public class RollbackCleanupTest extends AITest {
++
++    @Test
++    public void snapshotRollbackClearsWhatTheSnapshotDoesNotHold() {
++        Game game = initAndCreateGame();
++        game.EXPERIMENTAL_RESTORE_SNAPSHOT = true;
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().setPriority(p);
++
++        Card card = addCardToZone("Shock", p, ZoneType.Hand);
++        SpellAbility sa = card.getFirstSpellAbility();
++        sa.setActivatingPlayer(p);
++
++        game.stashGameState();
++
++        // What casting leaves on the ability and the card.
++        sa.setXManaCostPaid(3);
++        card.setCastSA(sa);
++        card.setCastFrom(p.getZone(ZoneType.Hand));
++        game.getStack().freezeStack(sa);
++        AssertJUnit.assertTrue(game.getStack().isFrozen());
++
++        GameActionUtil.rollbackAbility(sa, p.getZone(ZoneType.Hand), 0,
++                new CostPayment(sa.getPayCosts(), sa), card);
++
++        Card after = game.getCardState(card, null);
++        AssertJUnit.assertNotNull(after);
++        AssertJUnit.assertNull("announced X is cleared", sa.getXManaCostPaid());
++        AssertJUnit.assertNull("card is no longer marked as being cast", after.getCastSA());
++        AssertJUnit.assertNull("and no longer remembers where from", after.getCastFrom());
++        AssertJUnit.assertFalse("the stack is unfrozen again", game.getStack().isFrozen());
++    }
++}
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/SnapshotStolenCardTest.java b/forge-gui-desktop/src/test/java/forge/ai/SnapshotStolenCardTest.java
+new file mode 100644
+index 00000000..662e5faa
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/SnapshotStolenCardTest.java
+@@ -0,0 +1,53 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.card.Card;
++import forge.game.player.Player;
++import forge.game.zone.ZoneType;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++/**
++ * Reproduces #9297: taking a snapshot crashes with
++ * "IndexOutOfBoundsException: Index: 9, Size: 7" when a card whose controller is not its
++ * owner sits in an ordered hidden zone.
++ *
++ * Such a card belongs to its owner's graveyard, but the snapshot files it under the
++ * controller, so it is inserted into the wrong player's graveyard at the index it had in
++ * the owner's — past the end of the shorter list.
++ */
++public class SnapshotStolenCardTest extends AITest {
++
++    @Test
++    public void snapshotWithAStolenCardInAGraveyard() {
++        Game game = initAndCreateGame();
++        game.EXPERIMENTAL_RESTORE_SNAPSHOT = true;
++        Player owner = game.getPlayers().get(0);
++        Player thief = game.getPlayers().get(1);
++        game.getPhaseHandler().setPriority(owner);
++
++        // The thief's graveyard is shorter than the position the stolen card has in the
++        // owner's — 7 and 9 in the report.
++        for (int i = 0; i < 7; i++) {
++            addCardToZone("Mountain", thief, ZoneType.Graveyard);
++        }
++        for (int i = 0; i < 9; i++) {
++            addCardToZone("Forest", owner, ZoneType.Graveyard);
++        }
++        Card stolen = addCardToZone("Island", owner, ZoneType.Graveyard);
++        stolen.setController(thief, game.getNextTimestamp());
++
++        AssertJUnit.assertEquals(thief, stolen.getController());
++        AssertJUnit.assertEquals(owner, stolen.getOwner());
++        AssertJUnit.assertEquals(9, owner.getZone(ZoneType.Graveyard).getCards().indexOf(stolen));
++
++        game.stashGameState(); // threw IndexOutOfBoundsException
++
++        // The snapshot has to keep the card in the graveyard it is actually in.
++        AssertJUnit.assertTrue(game.restoreGameState());
++        Card after = game.findById(stolen.getId());
++        AssertJUnit.assertNotNull("stolen card survived the snapshot", after);
++        AssertJUnit.assertEquals(ZoneType.Graveyard, after.getZone().getZoneType());
++        AssertJUnit.assertEquals("still in its owner's graveyard", owner, after.getZone().getPlayer());
 +    }
 +}
 diff --git a/forge-gui/res/languages/en-US.properties b/forge-gui/res/languages/en-US.properties
