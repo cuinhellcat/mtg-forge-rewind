@@ -1,0 +1,595 @@
+diff --git a/forge-game/src/main/java/forge/game/Game.java b/forge-game/src/main/java/forge/game/Game.java
+index 3456a071..3bad73ba 100644
+--- a/forge-game/src/main/java/forge/game/Game.java
++++ b/forge-game/src/main/java/forge/game/Game.java
+@@ -102,7 +102,30 @@ public class Game {
+     // While this is false here, its really set by the Match/Preferences
+ 
+     // If this merges with LKI In the future, it will need to change forms
+-    private GameSnapshot previousGameState = null;
++    // Rewind points, newest first. The head is what rollbackAbility() restores when a
++    // cast is cancelled; the older ones back the host-side rewind (see rewindToActionOf).
++    private final Deque<RewindPoint> previousGameStates = new ArrayDeque<>();
++    // A restore is always followed by the main loop stashing an equivalent state again;
++    // replacing the head then keeps one entry per action instead of piling up duplicates.
++    private boolean replaceHeadOnNextStash = false;
++
++    /** How many own actions a player may rewind. Override with -Dforge.undoSteps=N. */
++    public static final int REWIND_STEPS = Math.max(0, Integer.getInteger("forge.undoSteps", 3));
++    /** Upper bound on stored rewind points; each one holds a full copy of the game. */
++    private static final int MAX_REWIND_POINTS = Math.max(1, Integer.getInteger("forge.undoBuffer", 16));
++
++    /** A snapshot plus the turn/priority bookkeeping that GameSnapshot itself does not cover. */
++    private static final class RewindPoint {
++        private final GameSnapshot snapshot;
++        private final PhaseHandler.PriorityState priorityState;
++        private final Player priorityPlayer;
++
++        private RewindPoint(GameSnapshot snapshot, PhaseHandler.PriorityState priorityState, Player priorityPlayer) {
++            this.snapshot = snapshot;
++            this.priorityState = priorityState;
++            this.priorityPlayer = priorityPlayer;
++        }
++    }
+     private CardCollection lastStateBattlefield = new CardCollection();
+     private CardCollection lastStateGraveyard = new CardCollection();
+ 
+@@ -200,21 +223,100 @@ public class Game {
+     public void stashGameState() {
+         // Take a snapshot of the current state to restore to previous state
+         if (EXPERIMENTAL_RESTORE_SNAPSHOT) {
+-            previousGameState = new GameSnapshot(this);
+-            previousGameState.makeCopy();
++            GameSnapshot snapshot = new GameSnapshot(this);
++            snapshot.makeCopy();
++
++            if (replaceHeadOnNextStash && !previousGameStates.isEmpty()) {
++                previousGameStates.removeFirst();
++            }
++            replaceHeadOnNextStash = false;
++
++            previousGameStates.addFirst(new RewindPoint(snapshot, phaseHandler.capturePriorityState(),
++                    phaseHandler.getPriorityPlayer()));
++            while (previousGameStates.size() > MAX_REWIND_POINTS) {
++                previousGameStates.removeLast();
++            }
+         }
+     }
+ 
+     public boolean restoreGameState() {
+         // Restore game state snapshot
+-        if (previousGameState == null || !EXPERIMENTAL_RESTORE_SNAPSHOT) {
++        if (previousGameStates.isEmpty() || !EXPERIMENTAL_RESTORE_SNAPSHOT) {
+             return false;
+         }
+ 
+-        previousGameState.restoreGameState(this);
++        restore(previousGameStates.peekFirst());
+         return true;
+     }
+ 
++    private void restore(RewindPoint point) {
++        point.snapshot.restoreGameState(this);
++        phaseHandler.restorePriorityState(point.priorityState);
++        replaceHeadOnNextStash = true;
++    }
++
++    /**
++     * How many of this player's own actions can still be rewound. Never more than
++     * REWIND_STEPS, and less than that early in the game or after a long AI sequence
++     * has pushed the older rewind points out of the buffer.
++     */
++    public int getAvailableRewindSteps(Player p) {
++        if (!EXPERIMENTAL_RESTORE_SNAPSHOT) {
++            return 0;
++        }
++        int found = 0;
++        for (RewindPoint point : skipCurrentPoint()) {
++            if (point.priorityPlayer == p && ++found == REWIND_STEPS) {
++                break;
++            }
++        }
++        return found;
++    }
++
++    /**
++     * The rewind points without the head. A point is stashed every time a player is about
++     * to act, so the head is the moment the player is in right now — rewinding to it would
++     * do nothing.
++     */
++    private Iterable<RewindPoint> skipCurrentPoint() {
++        return () -> {
++            final Iterator<RewindPoint> it = previousGameStates.iterator();
++            if (it.hasNext()) {
++                it.next();
++            }
++            return it;
++        };
++    }
++
++    /**
++     * Rewind the whole game to just before this player's n-th most recent action,
++     * discarding everything that happened since — including other players' and the
++     * AI's moves, which get played out again from there.
++     *
++     * @param steps 1 = undo the last own action, 2 = the one before it, ...
++     * @return true if a matching rewind point was found and restored
++     */
++    public boolean rewindToActionOf(Player p, int steps) {
++        if (!EXPERIMENTAL_RESTORE_SNAPSHOT || steps < 1 || steps > REWIND_STEPS) {
++            return false;
++        }
++
++        int found = 0;
++        for (RewindPoint point : skipCurrentPoint()) { // newest first
++            if (point.priorityPlayer != p || ++found < steps) {
++                continue;
++            }
++            // Everything newer than the target is gone for good — you can't redo a rewind.
++            while (previousGameStates.peekFirst() != point) {
++                previousGameStates.removeFirst();
++            }
++            restore(point);
++            fireEvent(new GameEventAddLog(GameLogEntryType.INFORMATION, p + " rewound the game."));
++            return true;
++        }
++        return false;
++    }
++
+     public void copyLastState() {
+         lastStateBattlefield.clear();
+         lastStateGraveyard.clear();
+diff --git a/forge-game/src/main/java/forge/game/GameSnapshot.java b/forge-game/src/main/java/forge/game/GameSnapshot.java
+index d74b5ca1..36554c11 100644
+--- a/forge-game/src/main/java/forge/game/GameSnapshot.java
++++ b/forge-game/src/main/java/forge/game/GameSnapshot.java
+@@ -14,6 +14,7 @@ import forge.game.spellability.SpellAbility;
+ import forge.game.spellability.SpellAbilityStackInstance;
+ import forge.game.trigger.TriggerType;
+ import forge.game.zone.PlayerZoneBattlefield;
++import forge.game.zone.Zone;
+ import forge.game.zone.ZoneType;
+ 
+ import java.util.Collections;
+@@ -334,6 +335,19 @@ public class GameSnapshot {
+             setCardInCopiedGame(toGame, ue.toPlayer, ue.fromCard, ue.newCard, ue.fromType, ue.zonePosition);
+         }
+ 
++        // Cards the current game has but the snapshot does not: tokens, copies and effect
++        // cards that came into being after it was taken. There is no earlier state to put
++        // them back into, so they leave the game — and the loops below would otherwise look
++        // them up in the snapshot and find nothing.
++        for (Card extraCard : toGame.getCardsInGame()) {
++            if (fromGame.findById(extraCard.getId()) == null) {
++                Zone zone = extraCard.getZone();
++                if (zone != null) {
++                    zone.remove(extraCard);
++                }
++            }
++        }
++
+         // This loop happens later to make sure all cards are in the correct zone first
+         for (Card newCard : toGame.getCardsIn(ZoneType.Battlefield)) {
+             Card fromCard = fromGame.findById(newCard.getId());
+diff --git a/forge-game/src/main/java/forge/game/phase/PhaseHandler.java b/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
+index c95b9061..606a041a 100644
+--- a/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
++++ b/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
+@@ -1062,6 +1062,15 @@ public class PhaseHandler implements java.io.Serializable, IHasForgeLog {
+ 
+                 chosenSa = pPlayerPriority.getController().chooseSpellAbilityToPlay();
+ 
++                // The player asked to rewind instead of acting. Do it here, where the state
++                // is between actions, and let the main game loop restart from the restored
++                // position on its next step.
++                final int rewindSteps = pPlayerPriority.getController().consumeRewindRequest();
++                if (rewindSteps > 0 && game.rewindToActionOf(pPlayerPriority, rewindSteps)) {
++                    pPlayerPriority.getController().afterRewind();
++                    return;
++                }
++
+                 // this needs to come after chosenSa so it sees you conceding on own turn
+                 if (playerTurn.hasLost() && pPlayerPriority.equals(playerTurn) && pFirstPriority.equals(playerTurn)) {
+                     // If the active player has lost, and they have priority, set the next player to have priority
+@@ -1211,6 +1220,74 @@ public class PhaseHandler implements java.io.Serializable, IHasForgeLog {
+ 
+     // this is a hack for the setup game state mode, do not use outside of devSetupGameState code
+     // as it avoids calling any of the phase effects that may be necessary in a less enforced context
++    /**
++     * The parts of the turn structure that GameSnapshot does not carry: who holds priority,
++     * who held it first this round, and the per-turn counters. Without these a restored
++     * snapshot would resume the main loop at the wrong player.
++     */
++    public static final class PriorityState implements java.io.Serializable {
++        private static final long serialVersionUID = 1L;
++
++        private final Player pPlayerPriority, pFirstPriority, playerPreviousTurn;
++        private final boolean givePriorityToPlayer, skipDamageSteps, bRepeatCleanup;
++        private final int nUpkeepsThisTurn, nUpkeepsThisGame, nCombatsThisTurn, nMainsThisTurn,
++                nEndOfTurnsThisTurn, planarDiceSpecialActionThisTurn;
++        private final List<ExtraTurn> extraTurns;
++        private final Map<PhaseType, List<ExtraPhase>> extraPhases;
++
++        private PriorityState(PhaseHandler ph) {
++            pPlayerPriority = ph.pPlayerPriority;
++            pFirstPriority = ph.pFirstPriority;
++            playerPreviousTurn = ph.playerPreviousTurn;
++            givePriorityToPlayer = ph.givePriorityToPlayer;
++            skipDamageSteps = ph.skipDamageSteps;
++            bRepeatCleanup = ph.bRepeatCleanup;
++            nUpkeepsThisTurn = ph.nUpkeepsThisTurn;
++            nUpkeepsThisGame = ph.nUpkeepsThisGame;
++            nCombatsThisTurn = ph.nCombatsThisTurn;
++            nMainsThisTurn = ph.nMainsThisTurn;
++            nEndOfTurnsThisTurn = ph.nEndOfTurnsThisTurn;
++            planarDiceSpecialActionThisTurn = ph.planarDiceSpecialActionThisTurn;
++            extraTurns = Lists.newArrayList(ph.extraTurns);
++            extraPhases = Maps.newEnumMap(PhaseType.class);
++            for (Map.Entry<PhaseType, Stack<ExtraPhase>> e : ph.extraPhases.entrySet()) {
++                extraPhases.put(e.getKey(), Lists.newArrayList(e.getValue()));
++            }
++        }
++    }
++
++    public PriorityState capturePriorityState() {
++        return new PriorityState(this);
++    }
++
++    public void restorePriorityState(final PriorityState s) {
++        pPlayerPriority = s.pPlayerPriority;
++        pFirstPriority = s.pFirstPriority;
++        playerPreviousTurn = s.playerPreviousTurn;
++        givePriorityToPlayer = s.givePriorityToPlayer;
++        skipDamageSteps = s.skipDamageSteps;
++        bRepeatCleanup = s.bRepeatCleanup;
++        nUpkeepsThisTurn = s.nUpkeepsThisTurn;
++        nUpkeepsThisGame = s.nUpkeepsThisGame;
++        nCombatsThisTurn = s.nCombatsThisTurn;
++        nMainsThisTurn = s.nMainsThisTurn;
++        nEndOfTurnsThisTurn = s.nEndOfTurnsThisTurn;
++        planarDiceSpecialActionThisTurn = s.planarDiceSpecialActionThisTurn;
++
++        extraTurns.clear();
++        extraTurns.addAll(s.extraTurns);
++        extraPhases.clear();
++        for (Map.Entry<PhaseType, List<ExtraPhase>> e : s.extraPhases.entrySet()) {
++            final Stack<ExtraPhase> stack = new Stack<>();
++            stack.addAll(e.getValue());
++            extraPhases.put(e.getKey(), stack);
++        }
++
++        for (final Player p : game.getPlayers()) {
++            p.setHasPriority(pPlayerPriority == p);
++        }
++    }
++
+     public final void devModeSet(final PhaseType phase0, final Player player0, boolean endCombat, int cturn) {
+         if (phase0 != null) {
+             setPhase(phase0);
+diff --git a/forge-game/src/main/java/forge/game/player/PlayerController.java b/forge-game/src/main/java/forge/game/player/PlayerController.java
+index ffce4494..365d3391 100644
+--- a/forge-game/src/main/java/forge/game/player/PlayerController.java
++++ b/forge-game/src/main/java/forge/game/player/PlayerController.java
+@@ -86,6 +86,19 @@ public abstract class PlayerController {
+         return false;
+     }
+ 
++    /**
++     * Number of own actions this controller wants rewound, consumed by the main game loop
++     * the next time this player holds priority. Only the local human controller ever
++     * returns more than 0 — see Game#rewindToActionOf.
++     */
++    public int consumeRewindRequest() {
++        return 0;
++    }
++
++    /** Called on the game thread right after a rewind this controller asked for. */
++    public void afterRewind() {
++    }
++
+     public Game getGame() { return gameView.getGame(); }
+     public Match getMatch() { return gameView.getMatch(); }
+     public Player getPlayer() { return player; }
+diff --git a/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java b/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java
+index 4281a454..3c3a76d7 100644
+--- a/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java
++++ b/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java
+@@ -15,6 +15,7 @@ import forge.gamemodes.match.YieldUpdate;
+ import forge.localinstance.properties.ForgePreferences;
+ import forge.localinstance.properties.ForgePreferences.FPref;
+ import forge.model.FModel;
++import forge.player.PlayerControllerHuman;
+ import forge.screens.match.CMatchUI;
+ import forge.screens.match.VAutoYieldsAndTriggers;
+ import forge.screens.match.VYieldSettings;
+@@ -37,6 +38,10 @@ public final class GameMenu {
+         final JMenu menu = new JMenu(localizer.getMessage("lblGame"));
+         menu.setMnemonic(KeyEvent.VK_G);
+         menu.add(getMenuItem_Undo());
++        final SkinnedMenuItem rewindItem = getMenuItem_Rewind();
++        if (rewindItem != null) {
++            menu.add(rewindItem);
++        }
+         menu.add(getMenuItem_Concede());
+         menu.add(getMenuItem_OfferDraw());
+         menu.add(getMenuItem_EndTurn());
+@@ -52,6 +57,10 @@ public final class GameMenu {
+         menu.addMenuListener(new MenuListener() {
+             @Override public void menuSelected(final MenuEvent e) {
+                 autoPassItem.setState(prefs.getPrefBoolean(FPref.YIELD_AUTO_PASS_NO_ACTIONS));
++                if (rewindItem != null) {
++                    rewindItem.setEnabled(((PlayerControllerHuman) matchUI.getGameController())
++                            .getAvailableRewindSteps() > 0);
++                }
+             }
+             @Override public void menuDeselected(final MenuEvent e) {}
+             @Override public void menuCanceled(final MenuEvent e) {}
+@@ -66,6 +75,21 @@ public final class GameMenu {
+         return menuItem;
+     }
+ 
++    /**
++     * Undoes the player's last action and everything that followed it, including the other
++     * players' and the AI's moves. Only offered to whoever runs the game (host or single
++     * player) — a network client has no game state to rewind.
++     */
++    private SkinnedMenuItem getMenuItem_Rewind() {
++        if (!(matchUI.getGameController() instanceof PlayerControllerHuman controller)) {
++            return null;
++        }
++        final Localizer localizer = Localizer.getInstance();
++        final SkinnedMenuItem menuItem = new SkinnedMenuItem(localizer.getMessage("lblRewind"));
++        menuItem.addActionListener(e -> controller.requestRewind(1));
++        return menuItem;
++    }
++
+     private SkinnedMenuItem getMenuItem_Undo() {
+         final Localizer localizer = Localizer.getInstance();
+         final SkinnedMenuItem menuItem = new SkinnedMenuItem(localizer.getMessage("lblUndo"));
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java
+new file mode 100644
+index 00000000..e03c3f22
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java
+@@ -0,0 +1,140 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.phase.PhaseHandler;
++import forge.game.phase.PhaseType;
++import forge.game.player.Player;
++import forge.game.zone.ZoneType;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++/**
++ * Tests for the multi step rewind (Game#rewindToActionOf), which lets the player running
++ * the game take back their last few actions along with everything that happened after.
++ *
++ * A rewind point is stashed every time a player is about to act, so the newest one is
++ * always "right now" and is skipped when counting steps back.
++ */
++public class RewindTest extends AITest {
++
++    private Game gameWithRewind() {
++        Game game = initAndCreateGame();
++        game.EXPERIMENTAL_RESTORE_SNAPSHOT = true;
++        return game;
++    }
++
++    @Test
++    public void rewindTakesBackTheLastAction() {
++        Game game = gameWithRewind();
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().setPriority(p);
++
++        game.stashGameState();                  // before the action
++        addCard("Mountain", p);
++        p.setLife(15, null);
++        game.stashGameState();                  // "now"
++
++        AssertJUnit.assertEquals(1, game.getAvailableRewindSteps(p));
++        AssertJUnit.assertTrue(game.rewindToActionOf(p, 1));
++
++        AssertJUnit.assertEquals(0, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
++        AssertJUnit.assertEquals(20, game.getPlayers().get(0).getLife());
++    }
++
++    @Test
++    public void rewindGoesBackSeveralOwnActions() {
++        Game game = gameWithRewind();
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().setPriority(p);
++
++        game.stashGameState();
++        addCard("Mountain", p);
++        game.stashGameState();
++        addCard("Forest", p);
++        game.stashGameState();
++        addCard("Island", p);
++        game.stashGameState();                  // "now": three lands on the battlefield
++
++        AssertJUnit.assertEquals(3, game.getAvailableRewindSteps(p));
++
++        // Two steps back: the Island and the Forest are gone, the Mountain stays.
++        AssertJUnit.assertTrue(game.rewindToActionOf(p, 2));
++        AssertJUnit.assertEquals(1, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
++        AssertJUnit.assertEquals(1, countCardsWithName(game, "Mountain"));
++    }
++
++    @Test
++    public void rewindSkipsOtherPlayersPoints() {
++        Game game = gameWithRewind();
++        Player me = game.getPlayers().get(0);
++        Player other = game.getPlayers().get(1);
++        PhaseHandler ph = game.getPhaseHandler();
++
++        ph.setPriority(me);
++        game.stashGameState();                  // my point, before my action
++        addCard("Mountain", me);
++
++        ph.setPriority(other);
++        game.stashGameState();                  // the opponent acts in between
++        addCard("Swamp", other);
++
++        ph.setPriority(me);
++        game.stashGameState();                  // "now"
++
++        // One step back for me undoes my Mountain *and* the opponent's Swamp with it.
++        AssertJUnit.assertTrue(game.rewindToActionOf(me, 1));
++        AssertJUnit.assertEquals(0, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
++        AssertJUnit.assertEquals(0, game.getPlayers().get(1).getCardsIn(ZoneType.Battlefield).size());
++    }
++
++    @Test
++    public void rewindRestoresTurnAndPriority() {
++        Game game = gameWithRewind();
++        Player me = game.getPlayers().get(0);
++        Player other = game.getPlayers().get(1);
++        PhaseHandler ph = game.getPhaseHandler();
++
++        ph.setPriority(me);
++        game.stashGameState();
++        int turnBefore = ph.getTurn();
++
++        // The game moves on: other player's turn, later phase.
++        ph.devModeSet(PhaseType.COMBAT_DECLARE_ATTACKERS, other, turnBefore + 1);
++        ph.setPriority(other);
++        game.stashGameState();
++
++        ph.setPriority(me);
++        game.stashGameState();                  // "now"
++
++        AssertJUnit.assertTrue(game.rewindToActionOf(me, 1));
++        AssertJUnit.assertEquals(turnBefore, ph.getTurn());
++        AssertJUnit.assertEquals(PhaseType.MAIN1, ph.getPhase());
++        AssertJUnit.assertEquals(me, ph.getPriorityPlayer());
++    }
++
++    @Test
++    public void rewindIsLimitedAndDisabledWithoutSnapshots() {
++        Game game = gameWithRewind();
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().setPriority(p);
++
++        for (int i = 0; i < 10; i++) {
++            game.stashGameState();
++            addCard("Mountain", p);
++        }
++        game.stashGameState();
++
++        // Never more than the configured number of steps, and asking for more fails.
++        AssertJUnit.assertEquals(Game.REWIND_STEPS, game.getAvailableRewindSteps(p));
++        AssertJUnit.assertFalse(game.rewindToActionOf(p, Game.REWIND_STEPS + 1));
++
++        // Nothing is stored at all while the feature is off.
++        Game plain = initAndCreateGame();
++        Player q = plain.getPlayers().get(0);
++        plain.getPhaseHandler().setPriority(q);
++        plain.stashGameState();
++        plain.stashGameState();
++        AssertJUnit.assertEquals(0, plain.getAvailableRewindSteps(q));
++        AssertJUnit.assertFalse(plain.rewindToActionOf(q, 1));
++    }
++}
+diff --git a/forge-gui/res/languages/en-US.properties b/forge-gui/res/languages/en-US.properties
+index 8534573c..ec197f64 100644
+--- a/forge-gui/res/languages/en-US.properties
++++ b/forge-gui/res/languages/en-US.properties
+@@ -452,6 +452,9 @@ lblReleaseNotes=Release Notes
+ #GameMenu.java
+ lblGame=Game
+ lblUndo=Undo
++lblRewind=Rewind last action
++lblNothingToRewind=There is nothing left to rewind.
++lblRewindNeedsPriority=Rewinding only works while you have priority. Cancel what you are doing first.
+ lblAlphaStrike=Alpha Strike
+ lblEndTurn=End Turn
+ lblTargetingArcs=Targeting Arcs
+diff --git a/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java b/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java
+index b38e0942..dfeede7c 100644
+--- a/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java
++++ b/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java
+@@ -105,6 +105,20 @@ public final class FServerManager implements IHasForgeLog {
+         return clients.get(ch);
+     }
+ 
++    /**
++     * Make every connected client take a full game state on its next update instead of a
++     * delta. Needed after the host rewinds the game, since a delta cannot describe a jump
++     * backwards in time.
++     */
++    public void resyncAllClients() {
++        for (final RemoteClient client : clients.values()) {
++            final RemoteClientGuiGame gui = client.getGui();
++            if (gui != null) {
++                gui.setResyncPending();
++            }
++        }
++    }
++
+     /** O(n) scan — pod size is capped at 8, so the map keyed by Channel stays the source of truth. */
+     public RemoteClient getClientBySlotIndex(int slotIndex) {
+         for (RemoteClient client : clients.values()) {
+diff --git a/forge-gui/src/main/java/forge/player/PlayerControllerHuman.java b/forge-gui/src/main/java/forge/player/PlayerControllerHuman.java
+index ffb6a929..127d04d1 100644
+--- a/forge-gui/src/main/java/forge/player/PlayerControllerHuman.java
++++ b/forge-gui/src/main/java/forge/player/PlayerControllerHuman.java
+@@ -6,6 +6,7 @@ import forge.StaticData;
+ import forge.ai.AvailableActions;
+ import forge.game.GameState;
+ import forge.ai.PlayerControllerAi;
++import forge.gamemodes.net.server.FServerManager;
+ import forge.gamemodes.net.server.RemoteClientGuiGame;
+ import forge.card.*;
+ import forge.card.mana.ManaCost;
+@@ -2697,6 +2698,49 @@ public class PlayerControllerHuman extends PlayerController implements IGameCont
+         AchievementCollection.updateAll(this);
+     }
+ 
++    /** Set from the GUI thread, read by the game thread in PhaseHandler#mainLoopStep. */
++    private volatile int rewindStepsRequested = 0;
++
++    /** How many of this player's own actions can currently be rewound (0 = none). */
++    public int getAvailableRewindSteps() {
++        return getGame().getAvailableRewindSteps(player);
++    }
++
++    /**
++     * Ask the game loop to undo this player's last action, along with everything that
++     * happened after it. Called from the GUI thread; the rewind itself happens on the
++     * game thread, which is why this only ends the current input and sets a flag.
++     */
++    public void requestRewind(final int steps) {
++        if (getAvailableRewindSteps() < steps) {
++            getGui().message(localizer.getMessage("lblNothingToRewind"), localizer.getMessage("lblRewind"));
++            return;
++        }
++        if (!(inputProxy.getInput() instanceof InputPassPriority)) {
++            // Mid-cast or mid-payment the game thread is deep inside an action; cancel that
++            // first, then rewind.
++            getGui().message(localizer.getMessage("lblRewindNeedsPriority"), localizer.getMessage("lblRewind"));
++            return;
++        }
++        rewindStepsRequested = steps;
++        passPriority(); // ends the input so the game loop reaches the rewind check
++    }
++
++    @Override
++    public int consumeRewindRequest() {
++        final int steps = rewindStepsRequested;
++        rewindStepsRequested = 0;
++        return steps;
++    }
++
++    @Override
++    public void afterRewind() {
++        // Deltas can't express a jump backwards, so push the full state to every client.
++        if (FServerManager.getInstance().isHosting()) {
++            FServerManager.getInstance().resyncAllClients();
++        }
++    }
++
+     public boolean canUndoLastAction() {
+         if (!getGame().stack.canUndo(player)) {
+             return false;
