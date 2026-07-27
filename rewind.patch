@@ -1,87 +1,122 @@
 diff --git a/forge-game/src/main/java/forge/game/Game.java b/forge-game/src/main/java/forge/game/Game.java
-index 3456a071..f829c79d 100644
+index 3456a071..df116320 100644
 --- a/forge-game/src/main/java/forge/game/Game.java
 +++ b/forge-game/src/main/java/forge/game/Game.java
-@@ -102,7 +102,40 @@ public class Game {
-     // While this is false here, its really set by the Match/Preferences
+@@ -103,6 +103,48 @@ public class Game {
  
      // If this merges with LKI In the future, it will need to change forms
--    private GameSnapshot previousGameState = null;
-+    // Rewind points, newest first. The head is what rollbackAbility() restores when a
-+    // cast is cancelled; the older ones back the host-side rewind (see rewindToActionOf).
-+    private final Deque<RewindPoint> previousGameStates = new ArrayDeque<>();
-+    // A restore is always followed by the main loop stashing an equivalent state again;
-+    // replacing the head then keeps one entry per action instead of piling up duplicates.
-+    private boolean replaceHeadOnNextStash = false;
+     private GameSnapshot previousGameState = null;
 +
-+    /** How many own actions a player may rewind. Set by the Match from the preferences. */
++    /**
++     * Rewind points, newest first. One is taken at the start of each human player's own
++     * turn — see stashTurnRewindPoint for why that particular moment.
++     */
++    private final Deque<RewindPoint> turnRewindPoints = new ArrayDeque<>();
++
++    /** How many of their own turns a player may rewind. Set by the Match from the preferences. */
 +    public int REWIND_STEPS = 3;
-+    /** Upper bound on stored rewind points; each one holds a full copy of the game. */
-+    private static final int MAX_REWIND_POINTS = Math.max(1, Integer.getInteger("forge.undoBuffer", 16));
 +
-+    /** A snapshot plus the turn/priority bookkeeping that GameSnapshot itself does not cover. */
++    /**
++     * A rewind point is the game written out in Forge's own save format, the same one
++     * puzzles and saved games use. Stored as text rather than as a parsed GameState so it
++     * cannot hold on to live objects from the game it was taken in.
++     */
 +    private static final class RewindPoint {
-+        private final GameSnapshot snapshot;
++        private final List<String> stateText;
++        /** Turn and priority bookkeeping that the save format itself does not carry. */
 +        private final PhaseHandler.PriorityState priorityState;
-+        private final Player priorityPlayer;
-+        /** Where this point sits, so the player can be told what they are going back to. */
++        /**
++         * Emblems and the hidden helper cards behind lasting effects ("for the rest of the
++         * game", "you have no maximum hand size"). The save format can only name printed
++         * cards, so these would be dropped; the point holds on to the objects instead.
++         */
++        private final List<Pair<Card, Player>> commandEffects;
++        /** Whose turn this point is the start of; only that player is offered it. */
++        private final Player player;
 +        private final int turn;
-+        private final PhaseType phase;
 +
-+        private RewindPoint(GameSnapshot snapshot, PhaseHandler.PriorityState priorityState, Player priorityPlayer,
-+                int turn, PhaseType phase) {
-+            this.snapshot = snapshot;
++        private RewindPoint(List<String> stateText, PhaseHandler.PriorityState priorityState,
++                List<Pair<Card, Player>> commandEffects, Player player, int turn) {
++            this.stateText = stateText;
 +            this.priorityState = priorityState;
-+            this.priorityPlayer = priorityPlayer;
++            this.commandEffects = commandEffects;
++            this.player = player;
 +            this.turn = turn;
-+            this.phase = phase;
 +        }
 +
 +        private String describe() {
-+            return "turn " + turn + (phase == null ? "" : ", " + phase.nameForUi);
++            return String.valueOf(turn);
 +        }
 +    }
      private CardCollection lastStateBattlefield = new CardCollection();
      private CardCollection lastStateGraveyard = new CardCollection();
  
-@@ -200,21 +233,123 @@ public class Game {
-     public void stashGameState() {
-         // Take a snapshot of the current state to restore to previous state
-         if (EXPERIMENTAL_RESTORE_SNAPSHOT) {
--            previousGameState = new GameSnapshot(this);
--            previousGameState.makeCopy();
-+            GameSnapshot snapshot = new GameSnapshot(this);
-+            snapshot.makeCopy();
-+
-+            if (replaceHeadOnNextStash && !previousGameStates.isEmpty()) {
-+                previousGameStates.removeFirst();
-+            }
-+            replaceHeadOnNextStash = false;
-+
-+            previousGameStates.addFirst(new RewindPoint(snapshot, phaseHandler.capturePriorityState(),
-+                    phaseHandler.getPriorityPlayer(), phaseHandler.getTurn(), phaseHandler.getPhase()));
-+            while (previousGameStates.size() > MAX_REWIND_POINTS) {
-+                previousGameStates.removeLast();
-+            }
-         }
-     }
- 
-     public boolean restoreGameState() {
-         // Restore game state snapshot
--        if (previousGameState == null || !EXPERIMENTAL_RESTORE_SNAPSHOT) {
-+        if (previousGameStates.isEmpty() || !EXPERIMENTAL_RESTORE_SNAPSHOT) {
-             return false;
-         }
- 
--        previousGameState.restoreGameState(this);
-+        restore(previousGameStates.peekFirst());
+@@ -215,6 +257,180 @@ public class Game {
          return true;
      }
  
-+    private void restore(RewindPoint point) {
-+        point.snapshot.restoreGameState(this);
-+        phaseHandler.restorePriorityState(point.priorityState);
-+        replaceHeadOnNextStash = true;
++    /**
++     * Remember where this turn started, if this is the right moment for it.
++     *
++     * The save format carries no "until end of turn" effects and no running combat, so a
++     * point taken mid-turn would always be missing something. The start of a player's own
++     * turn is the one moment where that does not matter: the previous turn's temporary
++     * effects have already worn off in its cleanup step, no combat is running, and by the
++     * first main phase the upkeep and draw triggers have finished resolving. Hence the
++     * conditions below — own turn, first main phase, empty stack, and only once per turn.
++     */
++    public void stashTurnRewindPoint(Player p) {
++        if (REWIND_STEPS < 1 || p == null) {
++            return;
++        }
++        if (p != phaseHandler.getPlayerTurn() || phaseHandler.getPhase() != PhaseType.MAIN1) {
++            return;
++        }
++        if (!stack.isEmpty() || stack.isFrozen()) {
++            return;
++        }
++        final RewindPoint newest = turnRewindPoints.peekFirst();
++        if (newest != null && newest.player == p && newest.turn == phaseHandler.getTurn()) {
++            return; // already have this turn, including right after rewinding back into it
++        }
++
++        final GameState state = new GameState();
++        try {
++            state.initFromGame(this);
++        } catch (Exception e) {
++            Logger.warn(e, "Could not record a rewind point for turn {}", phaseHandler.getTurn());
++            return;
++        }
++        turnRewindPoints.addFirst(new RewindPoint(Arrays.asList(state.toString().split("\n")),
++                phaseHandler.capturePriorityState(), collectCommandEffects(), p, phaseHandler.getTurn()));
++
++        // Trim per player, so a second human at the table cannot push someone else's
++        // points out of the list before they have used up their own allowance.
++        int mine = 0;
++        for (Iterator<RewindPoint> it = turnRewindPoints.iterator(); it.hasNext();) {
++            if (it.next().player == p && ++mine > REWIND_STEPS) {
++                it.remove();
++            }
++        }
++    }
++
++    /**
++     * The cards in the command zone that the save format cannot describe, because it can
++     * only write down printed cards and tokens. Emblems and the helper cards that carry
++     * lasting effects are neither, so applying a state silently drops them — see the
++     * paper card check in GameState#addCard. Keeping the objects themselves lets a rewind
++     * put back exactly the ones that existed at that moment.
++     */
++    private List<Pair<Card, Player>> collectCommandEffects() {
++        final List<Pair<Card, Player>> out = Lists.newArrayList();
++        for (final Player p : getPlayers()) {
++            for (final Card c : p.getZone(ZoneType.Command).getCards()) {
++                if (c.getPaperCard() == null && !c.isToken()) {
++                    out.add(Pair.of(c, p));
++                }
++            }
++        }
++        return out;
 +    }
 +
 +    /**
@@ -90,12 +125,9 @@ index 3456a071..f829c79d 100644
 +     */
 +    public List<String> describeRewindPoints(Player p) {
 +        List<String> out = Lists.newArrayList();
-+        for (RewindPoint point : skipCurrentPoint()) {
-+            if (point.priorityPlayer == p) {
++        for (RewindPoint point : turnRewindPoints) {
++            if (point.player == p) {
 +                out.add(point.describe());
-+                if (out.size() == REWIND_STEPS) {
-+                    break;
-+                }
 +            }
 +        }
 +        return out;
@@ -103,68 +135,96 @@ index 3456a071..f829c79d 100644
 +
 +    /** Drops the rewind history, e.g. after loading a save — it belongs to another game. */
 +    public void clearRewindPoints() {
-+        previousGameStates.clear();
-+        replaceHeadOnNextStash = false;
++        turnRewindPoints.clear();
 +    }
 +
 +    /**
-+     * How many of this player's own actions can still be rewound. Never more than
-+     * REWIND_STEPS, and less than that early in the game or after a long AI sequence
-+     * has pushed the older rewind points out of the buffer.
++     * How many of this player's own turns can still be rewound to. Never more than
++     * REWIND_STEPS, and less than that in the opening turns of a game.
 +     */
 +    public int getAvailableRewindSteps(Player p) {
-+        if (!EXPERIMENTAL_RESTORE_SNAPSHOT) {
-+            return 0;
-+        }
 +        int found = 0;
-+        for (RewindPoint point : skipCurrentPoint()) {
-+            if (point.priorityPlayer == p && ++found == REWIND_STEPS) {
-+                break;
++        for (RewindPoint point : turnRewindPoints) {
++            if (point.player == p) {
++                found++;
 +            }
 +        }
 +        return found;
 +    }
 +
 +    /**
-+     * The rewind points without the head. A point is stashed every time a player is about
-+     * to act, so the head is the moment the player is in right now — rewinding to it would
-+     * do nothing.
-+     */
-+    private Iterable<RewindPoint> skipCurrentPoint() {
-+        return () -> {
-+            final Iterator<RewindPoint> it = previousGameStates.iterator();
-+            if (it.hasNext()) {
-+                it.next();
-+            }
-+            return it;
-+        };
-+    }
-+
-+    /**
-+     * Rewind the whole game to just before this player's n-th most recent action,
-+     * discarding everything that happened since — including other players' and the
-+     * AI's moves, which get played out again from there.
++     * Rewind the whole game to the start of this player's n-th most recent own turn,
++     * discarding everything that happened since — including other players' and the AI's
++     * moves, which get played out again from there.
 +     *
-+     * @param steps 1 = undo the last own action, 2 = the one before it, ...
++     * @param steps 1 = back to the start of the current or last own turn, 2 = the one before it, ...
 +     * @return true if a matching rewind point was found and restored
 +     */
 +    public boolean rewindToActionOf(Player p, int steps) {
-+        if (!EXPERIMENTAL_RESTORE_SNAPSHOT || steps < 1 || steps > REWIND_STEPS) {
++        if (steps < 1 || steps > REWIND_STEPS) {
 +            return false;
 +        }
 +
 +        int found = 0;
-+        for (RewindPoint point : skipCurrentPoint()) { // newest first
-+            if (point.priorityPlayer != p || ++found < steps) {
++        for (RewindPoint point : turnRewindPoints) { // newest first
++            if (point.player != p || ++found < steps) {
 +                continue;
 +            }
-+            // Everything newer than the target is gone for good — you can't redo a rewind.
-+            while (previousGameStates.peekFirst() != point) {
-+                previousGameStates.removeFirst();
++            final GameState state = new GameState();
++            try {
++                state.parse(point.stateText);
++                // Applying a state only adds the spells it recorded, it never clears what
++                // is there — so anything in flight when the rewind was asked for would
++                // survive it. A turn is starting over: nothing may be waiting to resolve.
++                stack.clearSimultaneousStack();
++                stack.clearFrozen();
++                stack.clearUndoStack();
++                stack.clear();
++                state.applyToGame(this);
++            } catch (Exception e) {
++                Logger.error(e, "Rewind to turn {} failed", point.turn);
++                return false;
 +            }
-+            restore(point);
-+            fireEvent(new GameEventAddLog(GameLogEntryType.INFORMATION, p + " rewound the game."));
++            phaseHandler.restorePriorityState(point.priorityState);
++            restoreCommandEffects(point);
++            // Everything newer than the target is gone for good — you can't redo a rewind.
++            while (turnRewindPoints.peekFirst() != point) {
++                turnRewindPoints.removeFirst();
++            }
++            fireEvent(new GameEventAddLog(GameLogEntryType.INFORMATION,
++                    p + " rewound the game to turn " + point.turn + "."));
 +            return true;
++        }
++        return false;
++    }
++
++    /**
++     * Puts back the emblems and lasting-effect helper cards the state could not carry.
++     * Applying a state empties the command zone, so anything created after the point is
++     * already gone and only what belongs there is added back.
++     */
++    private void restoreCommandEffects(RewindPoint point) {
++        for (final Pair<Card, Player> entry : point.commandEffects) {
++            final Zone zone = entry.getRight().getZone(ZoneType.Command);
++            final Card effect = entry.getLeft();
++            // Applying the state rebuilds a few of these itself — the commander, speed and
++            // adventure effects among them — and the rebuilt one is the better copy,
++            // because it points at the cards the state just created. An Adventure reminder
++            // is named after the adventure half, so it will not match by name.
++            if (zone.contains(effect) || hasEffectNamed(zone, effect.getName())
++                    || effect.getName().endsWith("'s Adventure")) {
++                continue;
++            }
++            zone.add(effect);
++        }
++        action.checkStateEffects(true);
++    }
++
++    private static boolean hasEffectNamed(Zone zone, String name) {
++        for (final Card c : zone.getCards()) {
++            if (c.getPaperCard() == null && c.getName().equals(name)) {
++                return true;
++            }
 +        }
 +        return false;
 +    }
@@ -172,6 +232,92 @@ index 3456a071..f829c79d 100644
      public void copyLastState() {
          lastStateBattlefield.clear();
          lastStateGraveyard.clear();
+diff --git a/forge-game/src/main/java/forge/game/GameActionUtil.java b/forge-game/src/main/java/forge/game/GameActionUtil.java
+index 432477be..a666743a 100644
+--- a/forge-game/src/main/java/forge/game/GameActionUtil.java
++++ b/forge-game/src/main/java/forge/game/GameActionUtil.java
+@@ -944,6 +944,20 @@ public final class GameActionUtil {
+             // If we're able to restore the whole game state when rolling back an ability don't try to manually roll back
+             System.out.println("Restored state from snapshot! Rolled back: " + ability.getHostCard().getName() + " - " + ability.getActivatingPlayer());
+ 
++            // The snapshot covers the cards, their zones and the mana pool, so the manual
++            // rollback below and its refund would double up on it. The ability is not part of
++            // the snapshot though, and neither is the frozen stack: without the cleanup an
++            // announced value or a chosen target survives into the next attempt to cast the
++            // card, and the stack stays frozen.
++            Card restored = game.getCardState(oldCard, null);
++            if (restored != null) {
++                restored.setCastSA(null);
++                restored.setCastFrom(null);
++            }
++            resetAnnouncedCosts(ability);
++            resetChosenTargets(ability);
++            game.getStack().clearFrozen();
++            game.getTriggerHandler().clearWaitingTriggers();
+             return;
+         }
+ 
+@@ -964,18 +978,7 @@ public final class GameActionUtil {
+             Integer newPosition = zonePosition >= 0 ? Math.min(zonePosition, fromZone.size()) : null;
+             fromZone.add(oldCard, newPosition, null, true);
+             ability.setHostCard(oldCard);
+-            ability.setXManaCostPaid(null);
+-            ability.setSpendPhyrexianMana(false);
+-            ability.clearPipsToReduce();
+-            ability.setPaidLife(0);
+-            if (ability.hasParam("Announce")) {
+-                for (final String aVar : ability.getParam("Announce").split(",")) {
+-                    final String varName = aVar.trim();
+-                    if (!varName.equals("X")) {
+-                        ability.setSVar(varName, "0");
+-                    }
+-                }
+-            }
++            resetAnnouncedCosts(ability);
+             // better safe than sorry approach in case rolled back ability was copy (from addExtraKeywordCost)
+             for (SpellAbility sa : oldCard.getSpells()) {
+                 sa.setHostCard(oldCard);
+@@ -996,6 +999,30 @@ public final class GameActionUtil {
+             }
+         }
+ 
++        resetChosenTargets(ability);
++        payment.refundPayment();
++        game.getStack().clearFrozen();
++        game.getTriggerHandler().clearWaitingTriggers();
++    }
++
++    /** Values the player announced or committed to while casting, which a snapshot does not hold. */
++    private static void resetAnnouncedCosts(SpellAbility ability) {
++        ability.setXManaCostPaid(null);
++        ability.setSpendPhyrexianMana(false);
++        ability.clearPipsToReduce();
++        ability.setPaidLife(0);
++        if (ability.hasParam("Announce")) {
++            for (final String aVar : ability.getParam("Announce").split(",")) {
++                final String varName = aVar.trim();
++                if (!varName.equals("X")) {
++                    ability.setSVar(varName, "0");
++                }
++            }
++        }
++    }
++
++    /** Modes and targets picked while casting, likewise not covered by a snapshot. */
++    private static void resetChosenTargets(SpellAbility ability) {
+         if (ability.getApi() == ApiType.Charm) {
+             // reset chain
+             ability.setSubAbility(null);
+@@ -1005,9 +1032,6 @@ public final class GameActionUtil {
+         ability.clearTargets();
+ 
+         ability.resetOnceResolved();
+-        payment.refundPayment();
+-        game.getStack().clearFrozen();
+-        game.getTriggerHandler().clearWaitingTriggers();
+     }
+ 
+ }
 diff --git a/forge-game/src/main/java/forge/game/GameSnapshot.java b/forge-game/src/main/java/forge/game/GameSnapshot.java
 index d74b5ca1..b3193c76 100644
 --- a/forge-game/src/main/java/forge/game/GameSnapshot.java
@@ -307,11 +453,129 @@ index d74b5ca1..b3193c76 100644
      private static SpellAbility findSAInCard(SpellAbility sa, Card c) {
          String saDesc = sa.getDescription();
          for (SpellAbility cardSa : c.getAllSpellAbilities()) {
+diff --git a/forge-game/src/main/java/forge/game/GameState.java b/forge-game/src/main/java/forge/game/GameState.java
+index 38039ad1..97915de6 100644
+--- a/forge-game/src/main/java/forge/game/GameState.java
++++ b/forge-game/src/main/java/forge/game/GameState.java
+@@ -70,6 +70,12 @@ public class GameState {
+ 
+     private final Map<Integer, Card> idToCard = new HashMap<>();
+     private final Map<Card, Integer> cardToAttachId = new HashMap<>();
++    /**
++     * Cards on an Adventure. Their permission effect goes into the command zone, which is
++     * set up after exile, so creating it while reading the exile zone would only see it
++     * wiped again — it has to wait until every zone is in place.
++     */
++    private final List<Card> cardsOnAdventure = new ArrayList<>();
+     private final Map<Card, Player> cardToEnchantPlayerId = new HashMap<>();
+     private final Map<Card, Integer> markedDamage = new HashMap<>();
+     private final Map<Card, List<String>> cardToChosenClrs = new HashMap<>();
+@@ -588,6 +594,7 @@ public class GameState {
+         }
+ 
+         idToCard.clear();
++        cardsOnAdventure.clear();
+         cardToAttachId.clear();
+         cardToEnchantPlayerId.clear();
+         cardToRememberedId.clear();
+@@ -617,6 +624,7 @@ public class GameState {
+         for (int i = 0; i < playerStates.size(); i++) {
+             setupPlayerState(game.getPlayers().get(i), playerStates.get(i));
+         }
++        handleAdventures();
+         handleCardAttachments();
+         handleChosenEntities();
+         handleRememberedEntities();
+@@ -1054,6 +1062,18 @@ public class GameState {
+         }
+     }
+ 
++    /**
++     * Gives back the permission that keeps a card on an Adventure castable while it waits
++     * in exile, built from the same definition the game itself uses.
++     */
++    private void handleAdventures() {
++        for (final Card c : cardsOnAdventure) {
++            final SpellAbility sa = CardFactoryUtil.makeAdventureEffect(c.getState(CardStateName.Secondary));
++            sa.setActivatingPlayer(c.getOwner());
++            sa.resolve();
++        }
++    }
++
+     private void handleCardAttachments() {
+         // Unattach all permanents first
+         for (Entry<Card, Integer> entry : cardToAttachId.entrySet()) {
+@@ -1334,14 +1354,7 @@ public class GameState {
+                     c.setBackSide(true);
+                 }
+                 else if (info.startsWith("OnAdventure")) {
+-                    String abAdventure = "DB$ Effect | RememberObjects$ Self | StaticAbilities$ Play | ForgetOnMoved$ Exile | Duration$ Permanent | ConditionDefined$ Self | ConditionPresent$ Card.!copiedSpell";
+-                    SpellAbility saAdventure = AbilityFactory.getAbility(abAdventure, c);
+-                    StringBuilder sbPlay = new StringBuilder();
+-                    sbPlay.append("Mode$ Continuous | MayPlay$ True | EffectZone$ Command | Affected$ Card.IsRemembered+nonAdventure");
+-                    sbPlay.append(" | AffectedZone$ Exile | Description$ You may cast the card.");
+-                    saAdventure.setSVar("Play", sbPlay.toString());
+-                    saAdventure.setActivatingPlayer(c.getOwner());
+-                    saAdventure.resolve();
++                    cardsOnAdventure.add(c);
+                     c.setExiledWith(c); // This seems to be the way it's set up internally. Potentially not needed here?
+                     c.setExiledBy(c.getController());
+                 } else if (info.startsWith("IsCommander")) {
+diff --git a/forge-game/src/main/java/forge/game/card/CardFactoryUtil.java b/forge-game/src/main/java/forge/game/card/CardFactoryUtil.java
+index 545242b9..a42a922b 100644
+--- a/forge-game/src/main/java/forge/game/card/CardFactoryUtil.java
++++ b/forge-game/src/main/java/forge/game/card/CardFactoryUtil.java
+@@ -4062,6 +4062,22 @@ public class CardFactoryUtil {
+ 
+         SpellAbility saExile = AbilityFactory.getAbility(abExile, card);
+ 
++        saExile.setSubAbility(makeAdventureEffect(card));
++
++        ReplacementEffect re = ReplacementHandler.parseReplacement(repeffstr, card.getCard(), true);
++
++        re.setOverridingAbility(saExile);
++        return re;
++    }
++
++    /**
++     * The effect that keeps a card on an Adventure castable while it sits in exile.
++     *
++     * Also needed when a game state is loaded, because the card comes back in exile with
++     * nothing to grant that permission. Shared so the two cannot drift apart — the copy in
++     * GameState had done exactly that.
++     */
++    public static AbilitySub makeAdventureEffect(CardState card) {
+         String abEffect = "DB$ Effect | RememberObjects$ Self | StaticAbilities$ Play | ForgetOnMoved$ Exile | Duration$ Permanent | ConditionDefined$ Self | ConditionPresent$ Card.!copiedSpell+!token | Adventure$ True";
+         AbilitySub saEffect = (AbilitySub)AbilityFactory.getAbility(abEffect, card);
+ 
+@@ -4070,12 +4086,7 @@ public class CardFactoryUtil {
+         sbPlay.append(" | AffectedZone$ Exile | Description$ You may cast EFFECTSOURCE.");
+         saEffect.setSVar("Play", sbPlay.toString());
+ 
+-        saExile.setSubAbility(saEffect);
+-
+-        ReplacementEffect re = ReplacementHandler.parseReplacement(repeffstr, card.getCard(), true);
+-
+-        re.setOverridingAbility(saExile);
+-        return re;
++        return saEffect;
+     }
+ 
+     public static ReplacementEffect setupOmenAbility(CardState card) {
 diff --git a/forge-game/src/main/java/forge/game/phase/PhaseHandler.java b/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
-index c95b9061..670ca4a0 100644
+index c95b9061..6c186922 100644
 --- a/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
 +++ b/forge-game/src/main/java/forge/game/phase/PhaseHandler.java
-@@ -1062,6 +1062,25 @@ public class PhaseHandler implements java.io.Serializable, IHasForgeLog {
+@@ -1059,9 +1059,34 @@ public class PhaseHandler implements java.io.Serializable, IHasForgeLog {
+                     return;
+                 }
+                 game.stashGameState();
++                // Record where this turn began, if this is that moment. Only for players
++                // who can actually ask for a rewind. Reading the game out does not change
++                // it, so the call is safe here; the timing conditions are checked inside.
++                if (!pPlayerPriority.getController().isAI()) {
++                    game.stashTurnRewindPoint(pPlayerPriority);
++                }
  
                  chosenSa = pPlayerPriority.getController().chooseSpellAbilityToPlay();
  
@@ -337,7 +601,7 @@ index c95b9061..670ca4a0 100644
                  // this needs to come after chosenSa so it sees you conceding on own turn
                  if (playerTurn.hasLost() && pPlayerPriority.equals(playerTurn) && pFirstPriority.equals(playerTurn)) {
                      // If the active player has lost, and they have priority, set the next player to have priority
-@@ -1211,6 +1230,74 @@ public class PhaseHandler implements java.io.Serializable, IHasForgeLog {
+@@ -1211,6 +1236,74 @@ public class PhaseHandler implements java.io.Serializable, IHasForgeLog {
  
      // this is a hack for the setup game state mode, do not use outside of devSetupGameState code
      // as it avoids calling any of the phase effects that may be necessary in a less enforced context
@@ -657,7 +921,7 @@ index c0141ae4..aedd1c85 100644
          return cbpStackAdditions;
      }
 diff --git a/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java b/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java
-index 4281a454..a80fcda6 100644
+index 4281a454..e344fed1 100644
 --- a/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java
 +++ b/forge-gui-desktop/src/main/java/forge/screens/match/menus/GameMenu.java
 @@ -1,6 +1,7 @@
@@ -695,13 +959,13 @@ index 4281a454..a80fcda6 100644
          menu.add(getMenuItem_Concede());
          menu.add(getMenuItem_OfferDraw());
          menu.add(getMenuItem_EndTurn());
-@@ -52,6 +66,29 @@ public final class GameMenu {
+@@ -52,6 +66,22 @@ public final class GameMenu {
          menu.addMenuListener(new MenuListener() {
              @Override public void menuSelected(final MenuEvent e) {
                  autoPassItem.setState(prefs.getPrefBoolean(FPref.YIELD_AUTO_PASS_NO_ACTIONS));
 +                if (rewindMenu != null) {
-+                    // Label every step with where it actually leads, and grey out the ones
-+                    // that have no rewind point behind them.
++                    // Name every entry after the turn it leads back to, and show only the
++                    // ones that have a recorded point behind them.
 +                    final PlayerControllerHuman controller =
 +                            (PlayerControllerHuman) matchUI.getGameController();
 +                    final List<String> points = controller.describeRewindPoints();
@@ -709,33 +973,27 @@ index 4281a454..a80fcda6 100644
 +                    rewindMenu.setEnabled(!points.isEmpty());
 +                    for (int i = 0; i < rewindMenu.getItemCount(); i++) {
 +                        final JMenuItem item = rewindMenu.getItem(i);
-+                        final String steps = i == 0
-+                                ? loc.getMessage("lblRewindOneAction")
-+                                : loc.getMessage("lblRewindManyActions", i + 1);
++                        item.setVisible(i < points.size());
 +                        if (i < points.size()) {
-+                            item.setEnabled(true);
-+                            item.setText(loc.getMessage("lblRewindPointAt", steps, points.get(i)));
-+                        } else {
-+                            item.setEnabled(false);
-+                            item.setText(loc.getMessage("lblRewindPointAt", steps,
-+                                    loc.getMessage("lblRewindNoPoints")));
++                            item.setText(loc.getMessage("lblRewindToTurn", points.get(i)));
 +                        }
 +                    }
 +                }
              }
              @Override public void menuDeselected(final MenuEvent e) {}
              @Override public void menuCanceled(final MenuEvent e) {}
-@@ -66,6 +103,54 @@ public final class GameMenu {
+@@ -66,6 +96,54 @@ public final class GameMenu {
          return menuItem;
      }
  
 +    /**
-+     * Undoes the player's last actions and everything that followed them, including the
-+     * other players' and the AI's moves. Only offered to whoever runs the game (host or
-+     * single player) — a network client has no game state to rewind.
++     * Restarts one of the player's own turns from its beginning, discarding everything
++     * that happened since — including the other players' and the AI's moves. Only offered
++     * to whoever runs the game (host or single player); a network client has no game state
++     * to rewind.
 +     *
-+     * One entry per step, so going back further than one action is a single click rather
-+     * than repeated rewinds, which is awkward once the AI has moved again in between.
++     * One entry per recorded turn, so going back further is a single click rather than
++     * repeated rewinds.
 +     */
 +    private JMenu getMenu_Rewind() {
 +        if (!(matchUI.getGameController() instanceof PlayerControllerHuman controller)) {
@@ -749,9 +1007,8 @@ index 4281a454..a80fcda6 100644
 +        final JMenu menu = new JMenu(localizer.getMessage("lblRewind"));
 +        for (int step = 1; step <= maxSteps; step++) {
 +            final int steps = step;
-+            final SkinnedMenuItem item = new SkinnedMenuItem(steps == 1
-+                    ? localizer.getMessage("lblRewindOneAction")
-+                    : localizer.getMessage("lblRewindManyActions", steps));
++            // Text is filled in when the menu opens, once the turn numbers are known.
++            final SkinnedMenuItem item = new SkinnedMenuItem(localizer.getMessage("lblRewindNoPoints"));
 +            item.addActionListener(e -> controller.requestRewind(steps));
 +            menu.add(item);
 +        }
@@ -780,6 +1037,87 @@ index 4281a454..a80fcda6 100644
      private SkinnedMenuItem getMenuItem_Undo() {
          final Localizer localizer = Localizer.getInstance();
          final SkinnedMenuItem menuItem = new SkinnedMenuItem(localizer.getMessage("lblUndo"));
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/AdventureGameStateTest.java b/forge-gui-desktop/src/test/java/forge/ai/AdventureGameStateTest.java
+new file mode 100644
+index 00000000..327d0284
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/AdventureGameStateTest.java
+@@ -0,0 +1,75 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.GameState;
++import forge.game.card.Card;
++import forge.game.phase.PhaseType;
++import forge.game.player.Player;
++import forge.game.spellability.SpellAbility;
++import forge.game.zone.ZoneType;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++import java.util.Arrays;
++
++/**
++ * A card on an Adventure waits in exile and its creature half stays castable. Loading a
++ * state used to lose that: the permission effect was created while the exile zone was
++ * being read, and setting up the command zone right afterwards wiped it again.
++ */
++public class AdventureGameStateTest extends AITest {
++
++    private void applyOnGameThread(final Game game, final String text) {
++        final Thread t = new Thread(() -> {
++            final GameState in = new GameState();
++            in.parse(Arrays.asList(text.split("\n")));
++            in.applyToGame(game);
++        }, "Game-test");
++        t.start();
++        try {
++            t.join();
++        } catch (InterruptedException e) {
++            throw new RuntimeException(e);
++        }
++    }
++
++    private SpellAbility creatureHalf(Game game, Player p) {
++        for (Card c : p.getZone(ZoneType.Exile).getCards()) {
++            for (SpellAbility sa : c.getAllPossibleAbilities(p, false)) {
++                if (!sa.isAdventure()) {
++                    return sa;
++                }
++            }
++        }
++        return null;
++    }
++
++    @Test
++    public void adventureCardStaysCastableAfterLoadingAState() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, 3);
++        game.getPhaseHandler().setPriority(p);
++
++        addCardToZone("Callous Sell-Sword", p, ZoneType.Exile);
++
++        final GameState written = new GameState();
++        written.initFromGame(game);
++        final String text = written.toString();
++        AssertJUnit.assertTrue("the state records the adventure", text.contains("OnAdventure"));
++
++        applyOnGameThread(game, text);
++
++        Player after = game.getPlayers().get(0);
++        AssertJUnit.assertEquals("the card is back in exile", 1, after.getZone(ZoneType.Exile).size());
++        AssertJUnit.assertNotNull("and its creature half can be cast from there", creatureHalf(game, after));
++
++        int reminders = 0;
++        for (Card c : after.getZone(ZoneType.Command).getCards()) {
++            if (c.getName().endsWith("'s Adventure")) {
++                reminders++;
++            }
++        }
++        AssertJUnit.assertEquals("exactly one reminder in the command zone", 1, reminders);
++    }
++}
 diff --git a/forge-gui-desktop/src/test/java/forge/ai/ForetellSnapshotTest.java b/forge-gui-desktop/src/test/java/forge/ai/ForetellSnapshotTest.java
 new file mode 100644
 index 00000000..bfdfbcc2
@@ -834,12 +1172,183 @@ index 00000000..bfdfbcc2
 +        AssertJUnit.assertTrue("card should still be foretold", after.isForetold());
 +    }
 +}
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindHandSizeTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindHandSizeTest.java
+new file mode 100644
+index 00000000..c3fc5d24
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/RewindHandSizeTest.java
+@@ -0,0 +1,75 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.card.Card;
++import forge.game.phase.PhaseType;
++import forge.game.player.Player;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++/**
++ * The save format does not record a player's maximum hand size, so a rewind can only get
++ * it right if it is recomputed from what is on the battlefield. These tests check that it
++ * is, in both directions.
++ */
++public class RewindHandSizeTest extends AITest {
++
++    private boolean rewind(final Game game, final Player p, final int steps) {
++        final boolean[] result = new boolean[1];
++        final Thread t = new Thread(() -> result[0] = game.rewindToActionOf(p, steps), "Game-test");
++        t.start();
++        try {
++            t.join();
++        } catch (InterruptedException e) {
++            throw new RuntimeException(e);
++        }
++        return result[0];
++    }
++
++    private void startTurn(Game game, Player p, int turn) {
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, turn);
++        game.getPhaseHandler().setPriority(p);
++    }
++
++    @Test
++    public void rewindTakesBackAnUnlimitedHandSize() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++        startTurn(game, p, 3);
++
++        game.stashTurnRewindPoint(p);
++        AssertJUnit.assertFalse("no tower yet", p.isUnlimitedHandSize());
++
++        addCard("Reliquary Tower", p);
++        game.getAction().checkStateEffects(true);
++        AssertJUnit.assertTrue("tower grants it", p.isUnlimitedHandSize());
++
++        AssertJUnit.assertTrue(rewind(game, p, 1));
++
++        Player after = game.getPlayers().get(0);
++        AssertJUnit.assertFalse("gone again with the tower", after.isUnlimitedHandSize());
++        AssertJUnit.assertEquals(7, after.getMaxHandSize());
++    }
++
++    @Test
++    public void rewindGivesAnUnlimitedHandSizeBack() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++        startTurn(game, p, 3);
++
++        Card tower = addCard("Reliquary Tower", p);
++        game.getAction().checkStateEffects(true);
++        AssertJUnit.assertTrue(p.isUnlimitedHandSize());
++
++        game.stashTurnRewindPoint(p);
++
++        game.getAction().destroy(tower, null, true, null);
++        game.getAction().checkStateEffects(true);
++        AssertJUnit.assertFalse("tower destroyed", p.isUnlimitedHandSize());
++
++        AssertJUnit.assertTrue(rewind(game, p, 1));
++
++        Player after = game.getPlayers().get(0);
++        AssertJUnit.assertTrue("tower is back, and so is the effect", after.isUnlimitedHandSize());
++    }
++}
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindLastingEffectTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindLastingEffectTest.java
+new file mode 100644
+index 00000000..e9ba6add
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/RewindLastingEffectTest.java
+@@ -0,0 +1,84 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.card.Card;
++import forge.game.phase.PhaseType;
++import forge.game.player.Player;
++import forge.game.spellability.SpellAbility;
++import forge.game.zone.ZoneType;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++/**
++ * Praetor's Counsel grants "you have no maximum hand size" for the rest of the game, and
++ * then goes to the graveyard. Nothing on the battlefield carries the effect afterwards —
++ * it lives on as an Effect card in the command zone. Does a rewind get that right?
++ */
++public class RewindLastingEffectTest extends AITest {
++
++    private boolean rewind(final Game game, final Player p, final int steps) {
++        final boolean[] result = new boolean[1];
++        final Thread t = new Thread(() -> result[0] = game.rewindToActionOf(p, steps), "Game-test");
++        t.start();
++        try {
++            t.join();
++        } catch (InterruptedException e) {
++            throw new RuntimeException(e);
++        }
++        return result[0];
++    }
++
++    private void castPraetorsCounsel(Game game, Player p) {
++        Card counsel = addCardToZone("Praetor's Counsel", p, ZoneType.Hand);
++        SpellAbility sa = counsel.getFirstSpellAbility();
++        sa.setActivatingPlayer(p);
++        game.getStack().add(sa);
++        playUntilStackClear(game);
++        game.getAction().checkStateEffects(true);
++    }
++
++    @Test
++    public void rewindTakesBackARestOfGameEffect() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, 3);
++        game.getPhaseHandler().setPriority(p);
++
++        game.stashTurnRewindPoint(p);
++        AssertJUnit.assertFalse("not yet cast", p.isUnlimitedHandSize());
++
++        castPraetorsCounsel(game, p);
++        AssertJUnit.assertTrue("the spell granted it", p.isUnlimitedHandSize());
++        AssertJUnit.assertEquals("and nothing on the battlefield carries it", 0,
++                p.getCardsIn(ZoneType.Battlefield).size());
++
++        AssertJUnit.assertTrue(rewind(game, p, 1));
++
++        Player after = game.getPlayers().get(0);
++        AssertJUnit.assertFalse("gone again after the rewind", after.isUnlimitedHandSize());
++        AssertJUnit.assertEquals(7, after.getMaxHandSize());
++    }
++
++    @Test
++    public void rewindKeepsARestOfGameEffectItWasTakenAfter() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, 3);
++        game.getPhaseHandler().setPriority(p);
++
++        castPraetorsCounsel(game, p);
++        AssertJUnit.assertTrue(p.isUnlimitedHandSize());
++
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, 5);
++        game.getPhaseHandler().setPriority(p);
++        game.stashTurnRewindPoint(p);
++
++        addCard("Mountain", p);
++        AssertJUnit.assertTrue(rewind(game, p, 1));
++
++        Player after = game.getPlayers().get(0);
++        AssertJUnit.assertEquals("the Mountain is gone", 0, after.getCardsIn(ZoneType.Battlefield).size());
++        AssertJUnit.assertTrue("but the rest-of-game effect is still there",
++                after.isUnlimitedHandSize());
++    }
++}
 diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java
 new file mode 100644
-index 00000000..a86ae44f
+index 00000000..99c7f15a
 --- /dev/null
 +++ b/forge-gui-desktop/src/test/java/forge/ai/RewindTest.java
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,182 @@
 +package forge.ai;
 +
 +import forge.game.Game;
@@ -851,133 +1360,175 @@ index 00000000..a86ae44f
 +import org.testng.annotations.Test;
 +
 +/**
-+ * Tests for the multi step rewind (Game#rewindToActionOf), which lets the player running
-+ * the game take back their last few actions along with everything that happened after.
++ * Tests for the turn based rewind (Game#stashTurnRewindPoint, Game#rewindToActionOf),
++ * which restarts one of the player's own turns from its beginning and throws away
++ * everything that happened since.
 + *
-+ * A rewind point is stashed every time a player is about to act, so the newest one is
-+ * always "right now" and is skipped when counting steps back.
++ * A point is recorded once per turn, in the turn player's first main phase with an empty
++ * stack, because that is the only moment the save format describes without gaps.
 + */
 +public class RewindTest extends AITest {
 +
-+    private Game gameWithRewind() {
-+        Game game = initAndCreateGame();
-+        game.EXPERIMENTAL_RESTORE_SNAPSHOT = true;
-+        return game;
++    /** Puts the game at the start of the given player's turn, ready for a rewind point. */
++    private void startTurn(Game game, Player p, int turn) {
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, turn);
++        game.getPhaseHandler().setPriority(p);
++    }
++
++    /**
++     * Restoring a state runs on the game thread, which in a real match is the thread the
++     * rewind is triggered from. Tests have no such thread, so borrow one — GameAction
++     * recognises it by its name.
++     */
++    private boolean rewind(final Game game, final Player p, final int steps) {
++        final boolean[] result = new boolean[1];
++        final Thread t = new Thread(() -> result[0] = game.rewindToActionOf(p, steps), "Game-test");
++        t.start();
++        try {
++            t.join();
++        } catch (InterruptedException e) {
++            throw new RuntimeException(e);
++        }
++        return result[0];
 +    }
 +
 +    @Test
-+    public void rewindTakesBackTheLastAction() {
-+        Game game = gameWithRewind();
++    public void rewindRestartsTheCurrentTurn() {
++        Game game = initAndCreateGame();
 +        Player p = game.getPlayers().get(0);
-+        game.getPhaseHandler().setPriority(p);
 +
-+        game.stashGameState();                  // before the action
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
++
 +        addCard("Mountain", p);
 +        p.setLife(15, null);
-+        game.stashGameState();                  // "now"
 +
 +        AssertJUnit.assertEquals(1, game.getAvailableRewindSteps(p));
-+        AssertJUnit.assertTrue(game.rewindToActionOf(p, 1));
++        AssertJUnit.assertTrue(rewind(game, p, 1));
 +
-+        AssertJUnit.assertEquals(0, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
-+        AssertJUnit.assertEquals(20, game.getPlayers().get(0).getLife());
++        Player after = game.getPlayers().get(0);
++        AssertJUnit.assertEquals(0, after.getCardsIn(ZoneType.Battlefield).size());
++        AssertJUnit.assertEquals(20, after.getLife());
 +    }
 +
 +    @Test
-+    public void rewindGoesBackSeveralOwnActions() {
-+        Game game = gameWithRewind();
++    public void rewindGoesBackSeveralOwnTurns() {
++        Game game = initAndCreateGame();
 +        Player p = game.getPlayers().get(0);
-+        game.getPhaseHandler().setPriority(p);
 +
-+        game.stashGameState();
++        startTurn(game, p, 1);
++        game.stashTurnRewindPoint(p);
 +        addCard("Mountain", p);
-+        game.stashGameState();
++
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
 +        addCard("Forest", p);
-+        game.stashGameState();
++
++        startTurn(game, p, 5);
++        game.stashTurnRewindPoint(p);
 +        addCard("Island", p);
-+        game.stashGameState();                  // "now": three lands on the battlefield
 +
 +        AssertJUnit.assertEquals(3, game.getAvailableRewindSteps(p));
 +
-+        // Two steps back: the Island and the Forest are gone, the Mountain stays.
-+        AssertJUnit.assertTrue(game.rewindToActionOf(p, 2));
-+        AssertJUnit.assertEquals(1, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
-+        AssertJUnit.assertEquals(1, countCardsWithName(game, "Mountain"));
++        // Three steps back is the oldest point: none of the lands had been played yet.
++        AssertJUnit.assertTrue(rewind(game, p, 3));
++        AssertJUnit.assertEquals(1, game.getPhaseHandler().getTurn());
++        AssertJUnit.assertEquals(0, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
 +    }
 +
 +    @Test
-+    public void rewindSkipsOtherPlayersPoints() {
-+        Game game = gameWithRewind();
++    public void rewindUndoesWhatHappenedInBetween() {
++        Game game = initAndCreateGame();
 +        Player me = game.getPlayers().get(0);
 +        Player other = game.getPlayers().get(1);
-+        PhaseHandler ph = game.getPhaseHandler();
 +
-+        ph.setPriority(me);
-+        game.stashGameState();                  // my point, before my action
++        startTurn(game, me, 3);
++        game.stashTurnRewindPoint(me);
 +        addCard("Mountain", me);
 +
-+        ph.setPriority(other);
-+        game.stashGameState();                  // the opponent acts in between
++        // The opponent's turn follows and they get something onto the battlefield too.
++        startTurn(game, other, 4);
 +        addCard("Swamp", other);
 +
-+        ph.setPriority(me);
-+        game.stashGameState();                  // "now"
++        startTurn(game, me, 5);
 +
-+        // One step back for me undoes my Mountain *and* the opponent's Swamp with it.
-+        AssertJUnit.assertTrue(game.rewindToActionOf(me, 1));
++        // Back to the start of my turn 3: my Mountain and their Swamp are both gone.
++        AssertJUnit.assertTrue(rewind(game, me, 1));
 +        AssertJUnit.assertEquals(0, game.getPlayers().get(0).getCardsIn(ZoneType.Battlefield).size());
 +        AssertJUnit.assertEquals(0, game.getPlayers().get(1).getCardsIn(ZoneType.Battlefield).size());
 +    }
 +
 +    @Test
-+    public void rewindRestoresTurnAndPriority() {
-+        Game game = gameWithRewind();
++    public void rewindRestoresTurnPhaseAndPriority() {
++        Game game = initAndCreateGame();
 +        Player me = game.getPlayers().get(0);
 +        Player other = game.getPlayers().get(1);
 +        PhaseHandler ph = game.getPhaseHandler();
 +
-+        ph.setPriority(me);
-+        game.stashGameState();
-+        int turnBefore = ph.getTurn();
++        startTurn(game, me, 7);
++        game.stashTurnRewindPoint(me);
 +
-+        // The game moves on: other player's turn, later phase.
-+        ph.devModeSet(PhaseType.COMBAT_DECLARE_ATTACKERS, other, turnBefore + 1);
++        ph.devModeSet(PhaseType.COMBAT_DECLARE_ATTACKERS, other, 8);
 +        ph.setPriority(other);
-+        game.stashGameState();
 +
-+        ph.setPriority(me);
-+        game.stashGameState();                  // "now"
-+
-+        AssertJUnit.assertTrue(game.rewindToActionOf(me, 1));
-+        AssertJUnit.assertEquals(turnBefore, ph.getTurn());
++        AssertJUnit.assertTrue(rewind(game, me, 1));
++        AssertJUnit.assertEquals(7, ph.getTurn());
 +        AssertJUnit.assertEquals(PhaseType.MAIN1, ph.getPhase());
 +        AssertJUnit.assertEquals(me, ph.getPriorityPlayer());
++        AssertJUnit.assertEquals(me, ph.getPlayerTurn());
 +    }
 +
 +    @Test
-+    public void rewindIsLimitedAndDisabledWithoutSnapshots() {
-+        Game game = gameWithRewind();
++    public void onlyOnePointPerTurnAndOnlyAtTheRightMoment() {
++        Game game = initAndCreateGame();
 +        Player p = game.getPlayers().get(0);
-+        game.getPhaseHandler().setPriority(p);
++        Player other = game.getPlayers().get(1);
 +
-+        for (int i = 0; i < 10; i++) {
-+            game.stashGameState();
-+            addCard("Mountain", p);
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
++        game.stashTurnRewindPoint(p);   // same turn again: ignored
++        AssertJUnit.assertEquals(1, game.getAvailableRewindSteps(p));
++
++        // Not the turn player.
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, other, 4);
++        game.stashTurnRewindPoint(p);
++        AssertJUnit.assertEquals(1, game.getAvailableRewindSteps(p));
++
++        // Own turn, but not the first main phase.
++        game.getPhaseHandler().devModeSet(PhaseType.UPKEEP, p, 5);
++        game.stashTurnRewindPoint(p);
++        AssertJUnit.assertEquals(1, game.getAvailableRewindSteps(p));
++    }
++
++    @Test
++    public void rewindIsLimitedToTheConfiguredDepth() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++
++        for (int turn = 1; turn <= 10; turn++) {
++            startTurn(game, p, turn);
++            game.stashTurnRewindPoint(p);
 +        }
-+        game.stashGameState();
 +
-+        // Never more than the configured number of steps, and asking for more fails.
 +        AssertJUnit.assertEquals(game.REWIND_STEPS, game.getAvailableRewindSteps(p));
-+        AssertJUnit.assertFalse(game.rewindToActionOf(p, game.REWIND_STEPS + 1));
++        AssertJUnit.assertFalse(rewind(game, p, game.REWIND_STEPS + 1));
 +
-+        // Nothing is stored at all while the feature is off.
-+        Game plain = initAndCreateGame();
-+        Player q = plain.getPlayers().get(0);
-+        plain.getPhaseHandler().setPriority(q);
-+        plain.stashGameState();
-+        plain.stashGameState();
-+        AssertJUnit.assertEquals(0, plain.getAvailableRewindSteps(q));
-+        AssertJUnit.assertFalse(plain.rewindToActionOf(q, 1));
++        // The oldest points were dropped, so the deepest step is not turn 1 any more.
++        AssertJUnit.assertTrue(rewind(game, p, game.REWIND_STEPS));
++        AssertJUnit.assertEquals(11 - game.REWIND_STEPS, game.getPhaseHandler().getTurn());
++    }
++
++    @Test
++    public void rewindIsOffWhenTheDepthIsZero() {
++        Game game = initAndCreateGame();
++        Player p = game.getPlayers().get(0);
++        game.REWIND_STEPS = 0;
++
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
++
++        AssertJUnit.assertEquals(0, game.getAvailableRewindSteps(p));
++        AssertJUnit.assertFalse(rewind(game, p, 1));
 +    }
 +}
 diff --git a/forge-gui-desktop/src/test/java/forge/ai/RollbackCleanupTest.java b/forge-gui-desktop/src/test/java/forge/ai/RollbackCleanupTest.java
@@ -1249,10 +1800,10 @@ index 00000000..662e5faa
 +    }
 +}
 diff --git a/forge-gui/res/languages/en-US.properties b/forge-gui/res/languages/en-US.properties
-index 8534573c..22cbda89 100644
+index 8534573c..eda66c2b 100644
 --- a/forge-gui/res/languages/en-US.properties
 +++ b/forge-gui/res/languages/en-US.properties
-@@ -452,6 +452,22 @@ lblReleaseNotes=Release Notes
+@@ -452,6 +452,20 @@ lblReleaseNotes=Release Notes
  #GameMenu.java
  lblGame=Game
  lblUndo=Undo
@@ -1264,12 +1815,10 @@ index 8534573c..22cbda89 100644
 +lblGameSavedTo=Game saved to:
 +lblSaveNeedsPriority=Saving only works while you have priority. Finish what you are doing first.
 +lblLoadNeedsPriority=Loading only works while you have priority. Finish what you are doing first.
-+lblRewindOneAction=1 action back
-+lblRewindManyActions={0} actions back
-+lblRewindPointAt={0}  —  back to {1}
++lblRewindToTurn=Restart turn {0}
 +lblRewindNoPoints=(nothing to take back yet)
-+cbpRewindSteps=Rewind steps
-+nlRewindSteps=How many of your own actions the Game menu's rewind can take back. Needs EXPERIMENTAL Undo restore above. Each step holds a full copy of the game, so a large number costs memory. Applies to the next game started.
++cbpRewindSteps=Rewind turns
++nlRewindSteps=How many of your own turns the Game menu's rewind can restart. A position is recorded at the start of each of your turns, in your first main phase. Applies to the next game started.
 +lblNothingToRewind=There is nothing left to rewind.
 +lblRewindNeedsPriority=Rewinding only works while you have priority. Cancel what you are doing first.
  lblAlphaStrike=Alpha Strike
