@@ -1,8 +1,16 @@
 diff --git a/forge-game/src/main/java/forge/game/Game.java b/forge-game/src/main/java/forge/game/Game.java
-index 3456a071..df116320 100644
+index 3456a071..124936e8 100644
 --- a/forge-game/src/main/java/forge/game/Game.java
 +++ b/forge-game/src/main/java/forge/game/Game.java
-@@ -103,6 +103,48 @@ public class Game {
+@@ -55,6 +55,7 @@ import org.tinylog.Logger;
+ import org.tinylog.TaggedLogger;
+ 
+ import java.util.*;
++import java.util.function.BiConsumer;
+ import java.util.function.Predicate;
+ 
+ /**
+@@ -103,6 +104,60 @@ public class Game {
  
      // If this merges with LKI In the future, it will need to change forms
      private GameSnapshot previousGameState = null;
@@ -15,6 +23,18 @@ index 3456a071..df116320 100644
 +
 +    /** How many of their own turns a player may rewind. Set by the Match from the preferences. */
 +    public int REWIND_STEPS = 3;
++
++    /**
++     * Called with (turn, state text) whenever a rewind point is taken, so the position can
++     * also be put on disk. Set from the GUI side, which is what knows about folders; null
++     * in tests and on servers. A rewind point already exists in memory at that moment, so
++     * this costs nothing beyond the write itself.
++     */
++    private BiConsumer<Integer, List<String>> rewindAutosave = null;
++
++    public void setRewindAutosave(final BiConsumer<Integer, List<String>> hook) {
++        rewindAutosave = hook;
++    }
 +
 +    /**
 +     * A rewind point is the game written out in Forge's own save format, the same one
@@ -51,7 +71,7 @@ index 3456a071..df116320 100644
      private CardCollection lastStateBattlefield = new CardCollection();
      private CardCollection lastStateGraveyard = new CardCollection();
  
-@@ -215,6 +257,180 @@ public class Game {
+@@ -215,6 +270,190 @@ public class Game {
          return true;
      }
  
@@ -87,8 +107,18 @@ index 3456a071..df116320 100644
 +            Logger.warn(e, "Could not record a rewind point for turn {}", phaseHandler.getTurn());
 +            return;
 +        }
-+        turnRewindPoints.addFirst(new RewindPoint(Arrays.asList(state.toString().split("\n")),
++        final List<String> stateText = Arrays.asList(state.toString().split("\n"));
++        turnRewindPoints.addFirst(new RewindPoint(stateText,
 +                phaseHandler.capturePriorityState(), collectCommandEffects(), p, phaseHandler.getTurn()));
++
++        if (rewindAutosave != null) {
++            try {
++                rewindAutosave.accept(phaseHandler.getTurn(), stateText);
++            } catch (Exception e) {
++                // A full disk must never cost anyone their turn.
++                Logger.warn(e, "Could not autosave turn {}", phaseHandler.getTurn());
++            }
++        }
 +
 +        // Trim per player, so a second human at the table cannot push someone else's
 +        // points out of the list before they have used up their own allowance.
@@ -717,6 +747,82 @@ index ffce4494..a4bf3ea5 100644
      public Game getGame() { return gameView.getGame(); }
      public Match getMatch() { return gameView.getMatch(); }
      public Player getPlayer() { return player; }
+diff --git a/forge-gui-desktop/src/main/java/forge/gui/framework/DragCell.java b/forge-gui-desktop/src/main/java/forge/gui/framework/DragCell.java
+index 63aedf90..5178e803 100644
+--- a/forge-gui-desktop/src/main/java/forge/gui/framework/DragCell.java
++++ b/forge-gui-desktop/src/main/java/forge/gui/framework/DragCell.java
+@@ -13,6 +13,8 @@ import javax.swing.JLabel;
+ import javax.swing.JPanel;
+ import javax.swing.SwingConstants;
+ 
++import org.tinylog.Logger;
++
+ import com.google.common.collect.Lists;
+ 
+ import forge.localinstance.properties.ForgePreferences;
+@@ -267,9 +269,24 @@ public final class DragCell extends JPanel implements ILocalRepaint {
+      * @param doc0 &emsp; {@link forge.gui.framework.IVDoc} */
+     public void addDoc(final IVDoc<? extends ICDoc> doc0) {
+         if (doc0 instanceof VEmptyDoc) { return; }
++        if (allDocs.contains(doc0)) {
++            // Already here. Adding it again would list it twice while Swing merely moves
++            // the one tab label it has, leaving the list longer than the head bar — and the
++            // next add then aims past the end of it. The deck editor does exactly this when
++            // it puts its tabs back on the way out.
++            setSelected(getSelected());
++            return;
++        }
+         allDocs.add(doc0);
+         doc0.setParentCell(this);
+-        pnlHead.add(doc0.getTabLabel(), "h 100%!, gap " + tabPaddingPx + "px " + tabPaddingPx + "px 0 0", allDocs.size() - 1);
++        // Meant to append. Clamped, so a head bar that drifted out of step with the list
++        // cannot turn into an illegal position and take the whole action down with it.
++        final int position = Math.min(allDocs.size() - 1, pnlHead.getComponentCount());
++        if (position != allDocs.size() - 1) {
++            Logger.warn("Tab bar holds {} labels for {} docs; appending {} at {}",
++                    pnlHead.getComponentCount(), allDocs.size(), doc0.getDocumentID(), position);
++        }
++        pnlHead.add(doc0.getTabLabel(), "h 100%!, gap " + tabPaddingPx + "px " + tabPaddingPx + "px 0 0", position);
+ 
+         // Ensure that a tab is selected
+         setSelected(getSelected());
+@@ -312,13 +329,24 @@ public final class DragCell extends JPanel implements ILocalRepaint {
+         pnlBody.removeAll();
+ 
+         // Priorities are used to "remember" tab selection history.
+-        for (final IVDoc<? extends ICDoc> doc : allDocs) {
++        // Iterate a copy: populate() and update() can reach code that adds or removes
++        // docs from this very cell (zone tabs docking themselves in, dev mode coming
++        // and going, a match registering its views), which would blow up the iterator.
++        for (final IVDoc<? extends ICDoc> doc : Lists.newArrayList(allDocs)) {
+             if (doc.equals(doc0)) {
+                 docSelected = doc0;
+                 doc.getTabLabel().priorityOne();
+                 doc.getTabLabel().setSelected(true);
+-                doc.populate();
+-                doc.getLayoutControl().update();
++                // A panel that fails to fill itself must not take the screen down with it.
++                // This runs inside loadLayout, so an exception here used to abort the whole
++                // layout and leave an empty window over a still-running game.
++                try {
++                    doc.populate();
++                    doc.getLayoutControl().update();
++                } catch (final Exception ex) {
++                    Logger.error(ex, "Tab {} failed to populate; leaving it blank and carrying on",
++                            doc.getDocumentID());
++                }
+             }
+             else {
+                 doc.getTabLabel().setSelected(false);
+@@ -389,7 +417,7 @@ public final class DragCell extends JPanel implements ILocalRepaint {
+         DragTab temp;
+         int lowest = Integer.MAX_VALUE;
+ 
+-        for (final IVDoc<? extends ICDoc> d : allDocs) {
++        for (final IVDoc<? extends ICDoc> d : Lists.newArrayList(allDocs)) {
+             temp = d.getTabLabel();
+ 
+             // This line prevents two tabs from having the same priority.
 diff --git a/forge-gui-desktop/src/main/java/forge/menus/ForgeMenu.java b/forge-gui-desktop/src/main/java/forge/menus/ForgeMenu.java
 index a175bb39..425abf89 100644
 --- a/forge-gui-desktop/src/main/java/forge/menus/ForgeMenu.java
@@ -860,6 +966,29 @@ index 00000000..2fff29d1
 +        return highest + 1;
 +    }
 +}
+diff --git a/forge-gui-desktop/src/main/java/forge/screens/deckeditor/controllers/CAllDecks.java b/forge-gui-desktop/src/main/java/forge/screens/deckeditor/controllers/CAllDecks.java
+index 467db702..ab6a7c81 100644
+--- a/forge-gui-desktop/src/main/java/forge/screens/deckeditor/controllers/CAllDecks.java
++++ b/forge-gui-desktop/src/main/java/forge/screens/deckeditor/controllers/CAllDecks.java
+@@ -60,11 +60,16 @@ public enum CAllDecks implements ICDoc {
+             // This may be default and so requiring potential update!
+             ACEditorBase<? extends InventoryItem, ? extends DeckBase> editorCtrl =
+                     CDeckEditorUI.SINGLETON_INSTANCE.getCurrentEditorController();
+-            if (editorCtrl != null) {
++            // An editor exists well before its deck controller is wired up, and switching
++            // screens runs this in between. Asking it for a deck name then threw, which
++            // aborted the entire layout load and left the window with nothing in it.
++            if (editorCtrl != null && editorCtrl.getDeckController() != null) {
+                 String currentDeckName = editorCtrl.getDeckController().getModelName();
+                 if (currentDeckName != null && currentDeckName.length() > 0) {
+                     DeckProxy deckProxy = dm.stringToItem(currentDeckName);
+-                    if (deckProxy != null && !dm.getSelectedItem().equals(deckProxy))
++                    // deckProxy on the left: having nothing selected is a normal state,
++                    // and getSelectedItem() is null then.
++                    if (deckProxy != null && !deckProxy.equals(dm.getSelectedItem()))
+                         dm.setSelectedItem(deckProxy);
+                 }
+             }
 diff --git a/forge-gui-desktop/src/main/java/forge/screens/home/settings/CSubmenuPreferences.java b/forge-gui-desktop/src/main/java/forge/screens/home/settings/CSubmenuPreferences.java
 index 9915861a..68afd7ff 100644
 --- a/forge-gui-desktop/src/main/java/forge/screens/home/settings/CSubmenuPreferences.java
@@ -1170,6 +1299,93 @@ index 00000000..bfdfbcc2
 +        AssertJUnit.assertEquals("card should be back in exile", ZoneType.Exile, after.getZone().getZoneType());
 +        AssertJUnit.assertTrue("card should be face down again", after.isFaceDown());
 +        AssertJUnit.assertTrue("card should still be foretold", after.isForetold());
++    }
++}
+diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindAutosaveTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindAutosaveTest.java
+new file mode 100644
+index 00000000..4039561d
+--- /dev/null
++++ b/forge-gui-desktop/src/test/java/forge/ai/RewindAutosaveTest.java
+@@ -0,0 +1,81 @@
++package forge.ai;
++
++import forge.game.Game;
++import forge.game.phase.PhaseType;
++import forge.game.player.Player;
++import org.testng.AssertJUnit;
++import org.testng.annotations.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Every rewind point is also handed to whoever wants to put it on disk. Without that, a
++ * game whose window dies is only reachable by attaching to the live process — which is
++ * exactly the hole this closes.
++ */
++public class RewindAutosaveTest extends AITest {
++
++    private void startTurn(Game game, Player p, int turn) {
++        game.getPhaseHandler().devModeSet(PhaseType.MAIN1, p, turn);
++        game.getPhaseHandler().setPriority(p);
++    }
++
++    @Test
++    public void everyRewindPointIsOfferedForAutosaving() {
++        final Game game = initAndCreateGame();
++        final Player p = game.getPlayers().get(0);
++
++        final List<Integer> turns = new ArrayList<>();
++        final List<List<String>> texts = new ArrayList<>();
++        game.setRewindAutosave((turn, text) -> {
++            turns.add(turn);
++            texts.add(text);
++        });
++
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
++        startTurn(game, p, 5);
++        game.stashTurnRewindPoint(p);
++
++        AssertJUnit.assertEquals("one autosave per rewind point", 2, turns.size());
++        AssertJUnit.assertEquals(Integer.valueOf(3), turns.get(0));
++        AssertJUnit.assertEquals(Integer.valueOf(5), turns.get(1));
++        AssertJUnit.assertTrue("the text is the saved position",
++                String.join("\n", texts.get(1)).contains("turn=5"));
++    }
++
++    @Test
++    public void aFailingAutosaveDoesNotCostThePlayerTheirRewindPoint() {
++        final Game game = initAndCreateGame();
++        final Player p = game.getPlayers().get(0);
++
++        game.setRewindAutosave((turn, text) -> {
++            throw new RuntimeException("disk full");
++        });
++
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
++
++        AssertJUnit.assertEquals("the point is still there", 1, game.getAvailableRewindSteps(p));
++    }
++
++    @Test
++    public void turnsThatTakeNoRewindPointAlsoWriteNothing() {
++        final Game game = initAndCreateGame();
++        final Player p = game.getPlayers().get(0);
++
++        final List<Integer> turns = new ArrayList<>();
++        game.setRewindAutosave((turn, text) -> turns.add(turn));
++
++        startTurn(game, p, 3);
++        game.stashTurnRewindPoint(p);
++        game.stashTurnRewindPoint(p); // same turn again: already covered
++
++        game.getPhaseHandler().devModeSet(PhaseType.COMBAT_DECLARE_ATTACKERS, p, 4);
++        game.getPhaseHandler().setPriority(p);
++        game.stashTurnRewindPoint(p); // wrong phase
++
++        AssertJUnit.assertEquals(1, turns.size());
 +    }
 +}
 diff --git a/forge-gui-desktop/src/test/java/forge/ai/RewindHandSizeTest.java b/forge-gui-desktop/src/test/java/forge/ai/RewindHandSizeTest.java
@@ -1825,17 +2041,107 @@ index 8534573c..eda66c2b 100644
  lblEndTurn=End Turn
  lblTargetingArcs=Targeting Arcs
 diff --git a/forge-gui/src/main/java/forge/gamemodes/match/HostedMatch.java b/forge-gui/src/main/java/forge/gamemodes/match/HostedMatch.java
-index e944de68..53f8cd67 100644
+index e944de68..3e5f4a76 100644
 --- a/forge-gui/src/main/java/forge/gamemodes/match/HostedMatch.java
 +++ b/forge-gui/src/main/java/forge/gamemodes/match/HostedMatch.java
-@@ -161,6 +161,7 @@ public class HostedMatch {
+@@ -161,6 +161,8 @@ public class HostedMatch {
  
          game = match.createGame();
          game.EXPERIMENTAL_RESTORE_SNAPSHOT = FModel.getPreferences().getPrefBoolean(FPref.MATCH_EXPERIMENTAL_RESTORE);
 +        game.REWIND_STEPS = Math.max(0, FModel.getPreferences().getPrefInt(FPref.MATCH_REWIND_STEPS));
++        game.setRewindAutosave(RewindAutosave::write);
          game.AI_TIMEOUT = FModel.getPreferences().getPrefInt(FPref.MATCH_AI_TIMEOUT);
          // Android API 31 and above can use completeOnTimeout -> CompletableFuture:
          //https://developer.android.com/reference/java/util/concurrent/CompletableFuture#completeOnTimeout(T,%20long,%20java.util.concurrent.TimeUnit)
+diff --git a/forge-gui/src/main/java/forge/gamemodes/match/RewindAutosave.java b/forge-gui/src/main/java/forge/gamemodes/match/RewindAutosave.java
+new file mode 100644
+index 00000000..3163ccb6
+--- /dev/null
++++ b/forge-gui/src/main/java/forge/gamemodes/match/RewindAutosave.java
+@@ -0,0 +1,83 @@
++package forge.gamemodes.match;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.time.LocalDateTime;
++import java.time.format.DateTimeFormatter;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.List;
++
++import org.tinylog.Logger;
++
++import forge.localinstance.properties.ForgeConstants;
++
++/**
++ * Writes every rewind point to disk as well as into memory.
++ *
++ * Forge can end up with no window while the game itself is still running — a panel that
++ * throws while a screen is being switched aborts the layout load, and if the frame is then
++ * closed the position is only reachable by attaching to the live process. These files are
++ * the cheap way out of that: the last few turns are always on disk, loadable through
++ * <i>Forge &rarr; Load saved game</i>.
++ *
++ * The folder keeps a rolling window of the newest {@link #KEEP} files and deletes the rest,
++ * so it cannot grow without bound while still leaving a short history to pick from.
++ */
++public final class RewindAutosave {
++
++    /** How many autosaves to keep. Roughly the last hour of a game. */
++    private static final int KEEP = 12;
++
++    private static final String DIR = ForgeConstants.USER_GAMES_DIR + "autosave" + ForgeConstants.PATH_SEPARATOR;
++    private static final String PREFIX = "autosave_";
++    private static final String SUFFIX = ".txt";
++    private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
++
++    private RewindAutosave() { }
++
++    /** Where the files land, so callers can tell the user. */
++    public static String getFolder() {
++        return DIR;
++    }
++
++    public static void write(final int turn, final List<String> stateText) {
++        final Path dir = Paths.get(DIR);
++        try {
++            Files.createDirectories(dir);
++        } catch (IOException e) {
++            Logger.warn(e, "Could not create the autosave folder {}", DIR);
++            return;
++        }
++
++        final Path file = dir.resolve(String.format("%s%s_turn%d%s",
++                PREFIX, LocalDateTime.now().format(STAMP), turn, SUFFIX));
++        try {
++            Files.write(file, String.join("\n", stateText).getBytes(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            Logger.warn(e, "Could not write the autosave {}", file);
++            return;
++        }
++
++        prune(dir);
++    }
++
++    /** Drops everything past the newest KEEP files. Failure here is not worth reporting twice. */
++    private static void prune(final Path dir) {
++        final File[] saves = dir.toFile().listFiles(
++                (d, name) -> name.startsWith(PREFIX) && name.endsWith(SUFFIX));
++        if (saves == null || saves.length <= KEEP) {
++            return;
++        }
++        Arrays.sort(saves, Comparator.comparingLong(File::lastModified).reversed());
++        for (int i = KEEP; i < saves.length; i++) {
++            if (!saves[i].delete()) {
++                Logger.warn("Could not remove the old autosave {}", saves[i]);
++            }
++        }
++    }
++}
 diff --git a/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java b/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java
 index b38e0942..dfeede7c 100644
 --- a/forge-gui/src/main/java/forge/gamemodes/net/server/FServerManager.java

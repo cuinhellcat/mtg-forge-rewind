@@ -60,6 +60,17 @@ needing a game running first. Loading starts the match under puzzle rules so the
 mulligan prompt over an empty opening hand, and restores the default maximum hand size,
 which the saved format does not carry.
 
+**Autosave** (2.1) — every rewind point is written to `games/autosave/` as well, keeping a
+rolling window of the newest twelve. Load them the same way. No prompt on startup; the files
+are simply there if you want them.
+
+That one exists because of what 2.0 did not survive. A panel throwing while a screen was
+being switched aborted the whole layout load, and Forge's main frame is `DISPOSE_ON_CLOSE` —
+so the window went away while the game thread, not being a daemon, kept the process alive
+with a live quest match inside it and nothing left to click. Getting that match back took
+attaching an agent to the running JVM and walking the object graph to the `Game`. The three
+defects behind it are fixed below; the autosave is the belt to their braces.
+
 ## Included Forge fixes
 
 Rewinding leans on Forge's own machinery far harder than its normal use does, which brings
@@ -76,6 +87,10 @@ that fails without it.
 | A creature stolen after the snapshot stayed with the thief, and ended up in both battlefields at once. | not reported |
 | **Loading a state lost a card's Adventure.** The permission that keeps it castable in exile was created while the exile zone was being read, and setting up the command zone straight afterwards emptied it again. Also, the loader carried its own copy of the Adventure definition, which had drifted from the one the game builds. | not reported |
 | **Applying a state never cleared the stack**, it only added back what it had recorded, so anything in flight survived the load. Worked around here rather than fixed in `GameState`. | not reported |
+| Selecting a tab iterated the cell's doc list while calling code that adds and removes docs from it, so pressing the mouse on a tab could throw. | not reported |
+| **A null deck controller took the whole window down.** `CAllDecks.updateDeckManager` assumed an editor always has one; it does not yet while a screen is being switched to. Clicking a navigation tab threw, which aborted the layout load and left an empty window over a running game — and every later layout load failed the same way. | not reported |
+| Selecting a tab now survives a doc that throws while populating: that panel stays blank, the rest of the layout is built, the failure is logged. One broken panel should cost that panel, not the screen. | not reported |
+| `addDoc` listed a doc twice when it was already in the cell — which the deck editor does on its way out — leaving the tab bar shorter than the list, so the next add aimed past its end and **Forge could no longer be closed**. | not reported |
 
 The Adventure bug is a good illustration of the shape of these: the loader empties every
 zone, then builds the cards, then fills the zones — so anything it creates while building
@@ -126,13 +141,14 @@ it the new menu entries show their raw keys instead of labels.
 mvn -B -pl forge-gui-desktop -am test
 ```
 
-299 tests, all green. The rewind ones:
+302 tests, all green. The rewind ones:
 
 | Test | Covers |
 |---|---|
 | `RewindTest` | taking points, counting, depth, jumping back, turn/phase/priority |
 | `RewindHandSizeTest` | maximum hand size, in both directions |
 | `RewindLastingEffectTest` | rest-of-game effects (Praetor's Counsel) |
+| `RewindAutosaveTest` | every point is offered for autosaving, a failing write costs nothing |
 | `AdventureGameStateTest` | a card on an Adventure stays castable after a state is loaded |
 | `SnapshotStolenCardTest`, `SnapshotControlTest`, `SnapshotMeldTest`, `ForetellSnapshotTest`, `RollbackCleanupTest` | the Forge fixes above |
 
